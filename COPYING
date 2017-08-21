@@ -1,0 +1,2 @@
+1. The redis response parsing code is derived from hiredis. See COPYING.hiredis for hiredis copyright notice.
+2. The redismodule.h header file is copyed from redis distribution with required patches applied. See COPYING.redis for redis copyright notice.
