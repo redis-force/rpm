@@ -11,6 +11,7 @@ type RedisModule interface {
 	Stop()
 	Join()
 	Shutdown()
+	NewRedisClient() RedisClient
 }
 
 type RedisClient interface {

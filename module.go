@@ -41,14 +41,10 @@ func (module *redisModule) panicHandler(id int64) {
 
 func (module *redisModule) onRequest(client int64, id int64, request [][]byte) {
 	response := newResponse(id)
-	redis := &redisClient{
-		module: module,
-		future: make(chan redisResponse),
-	}
 	go func() {
 		defer module.panicHandler(id)
 		ctx := context.WithValue(context.Background(), sessionIdKey, client)
-		module.worker.OnCommand(ctx, redis, request, response)
+		module.worker.OnCommand(ctx, module.NewRedisClient(), request, response)
 		module.response.dispatch(response.serialize())
 	}()
 }
@@ -61,19 +57,11 @@ func (module *redisModule) Start() {
 	module.downstream.start(module)
 	module.response.start(module)
 	module.request.start(module)
-	redis := &redisClient{
-		module: module,
-		future: make(chan redisResponse),
-	}
-	module.worker.OnStart(context.Background(), redis)
+	module.worker.OnStart(context.Background(), module.NewRedisClient())
 }
 
 func (module *redisModule) Stop() {
-	redis := &redisClient{
-		module: module,
-		future: make(chan redisResponse),
-	}
-	module.worker.OnStop(context.Background(), redis)
+	module.worker.OnStop(context.Background(), module.NewRedisClient())
 	module.request.stop()
 	module.response.stop()
 	module.downstream.stop()
@@ -89,6 +77,13 @@ func (module *redisModule) Join() {
 	module.downstream.join()
 	module.response.join()
 	module.request.join()
+}
+
+func (module *redisModule) NewRedisClient() RedisClient {
+	return &redisClient{
+		module: module,
+		future: make(chan redisResponse),
+	}
 }
 
 func connectTo(env string) (net.Conn, error) {
