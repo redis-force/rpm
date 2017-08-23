@@ -6,5 +6,5 @@ all:
 clean:
 	make -C module clean
 
-sample: sample/sample.go
+sample:
 	go build -o bin/sample sample/sample.go

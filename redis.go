@@ -11,6 +11,10 @@ import (
 type redisRequest struct {
 	request  [][]interface{}
 	response chan redisResponse
+	buffer   []interface{}
+	index    int
+	wait     int
+	err      error
 }
 
 type redisResponse struct {
@@ -18,8 +22,23 @@ type redisResponse struct {
 	err   error
 }
 
-func (request *redisRequest) done(reply []interface{}, err error) {
-	request.response <- redisResponse{reply: reply, err: err}
+func (request *redisRequest) error(err error) {
+	request.err = err
+}
+
+func (request *redisRequest) done() {
+	request.response <- redisResponse{reply: request.buffer, err: request.err}
+}
+
+func (request *redisRequest) reply(reply interface{}) bool {
+	request.buffer[request.index] = reply
+	request.index++
+	if request.index == request.wait {
+		request.done()
+		return true
+	} else {
+		return false
+	}
 }
 
 type redisClient struct {
@@ -49,7 +68,7 @@ func (client *redisClient) Do(ctx context.Context, command string, args ...inter
 }
 
 func (client *redisClient) DoMulti(ctx context.Context, requests ...[]interface{}) (reply []interface{}, err error) {
-	client.module.downstream.dispatch(redisRequest{request: requests, response: client.future})
+	client.module.downstream.dispatch(&redisRequest{request: requests, response: client.future})
 	responses := <-client.future
 	return responses.reply, responses.err
 }

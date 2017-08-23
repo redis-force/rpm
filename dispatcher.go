@@ -47,31 +47,66 @@ func (dispatcher *dispatcherLifecycle) join() {
 
 type downstreamDispatcher struct {
 	dispatcherLifecycle
-	requests chan redisRequest
+	requests chan *redisRequest
+	pending  chan *redisRequest
 	conn     redis.Conn
 }
 
-func (dispatcher *downstreamDispatcher) run() {
+func (dispatcher *downstreamDispatcher) sender() {
 	conn := dispatcher.conn
-	for request := range dispatcher.requests {
-		reply := make([]interface{}, len(request.request))
+	pending := dispatcher.pending
+	requests := dispatcher.requests
+	for request := range requests {
 		var err error
-		for _, request := range request.request {
-			if err = conn.Send(request[0].(string), request[1:]...); err != nil {
-				goto done
+		for _, do := range request.request {
+			if err = conn.Send(do[0].(string), do[1:]...); err != nil {
+				request.error(err)
+				break
 			}
+			request.wait++
 		}
 		if err = conn.Flush(); err != nil {
-			goto done
+			/* shouldn't happen */
+			panic(err)
 		}
-		for idx := range reply {
-			if reply[idx], err = conn.Receive(); err != nil {
-				goto done
+		if request.wait > 0 {
+			request.buffer = make([]interface{}, request.wait)
+			pending <- request
+		} else {
+			request.done()
+		}
+	}
+}
+
+func (dispatcher *downstreamDispatcher) receiver() {
+	conn := dispatcher.conn
+	requests := dispatcher.pending
+	for pending := range requests {
+		for {
+			if reply, err := conn.Receive(); err != nil {
+				/* shouldn't happen */
+				panic(err)
+			} else {
+				if pending.reply(reply) {
+					break
+				}
 			}
 		}
-	done:
-		request.done(reply, err)
 	}
+}
+
+func (dispatcher *downstreamDispatcher) run() {
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		dispatcher.sender()
+	}()
+	go func() {
+		defer wait.Done()
+		dispatcher.receiver()
+	}()
+	wait.Wait()
 }
 
 func (dispatcher *downstreamDispatcher) start(module *redisModule) {
@@ -81,6 +116,7 @@ func (dispatcher *downstreamDispatcher) start(module *redisModule) {
 func (dispatcher *downstreamDispatcher) stop() {
 	dispatcher.doStop(func() {
 		close(dispatcher.requests)
+		close(dispatcher.pending)
 	})
 }
 
@@ -90,12 +126,13 @@ func (dispatcher *downstreamDispatcher) shutdown() {
 }
 
 func (dispatcher *downstreamDispatcher) dispatch(item interface{}) {
-	dispatcher.requests <- item.(redisRequest)
+	dispatcher.requests <- item.(*redisRequest)
 }
 
 func newDownstreamDispatcher() dispatcher {
 	return &downstreamDispatcher{
-		requests: make(chan redisRequest),
+		requests: make(chan *redisRequest),
+		pending:  make(chan *redisRequest),
 		conn:     redis.NewConn(downstream, time.Hour*0xFFFF, time.Hour*0xFFFF),
 	}
 }

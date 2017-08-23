@@ -100,10 +100,22 @@ func generate(index int, response rpm.RedisModuleResponse) {
 }
 
 func (w *worker) OnCommand(ctx context.Context, redis rpm.RedisClient, args [][]byte, response rpm.RedisModuleResponse) {
-	panic("intentionally")
 	w.logger.Printf("received request and generate response with type of %v", w.index)
 	generate(w.index, response)
 	w.index++
+	loops := w.index % 100
+	w.logger.Printf("send %d info commands to upstream", loops)
+	requests := make([][]interface{}, loops)
+	for i := 0; i < loops; i++ {
+		requests[i] = redis.Request("info")
+	}
+	if reply, err := redis.DoMulti(ctx, requests...); err != nil {
+		panic(err)
+	} else {
+		for idx, r := range reply {
+			w.logger.Printf("Reply[%d]:\n%v", idx, string(r.([]byte)))
+		}
+	}
 }
 
 func (w *worker) OnError(ctx context.Context, err error) {
@@ -117,7 +129,7 @@ func (w *worker) OnStop(ctx context.Context, redis rpm.RedisClient) {
 }
 
 func main() {
-	logger := log.New(os.Stderr, "", log.Lshortfile)
+	logger := log.New(os.Stdout, "", log.Lshortfile)
 	if module, err := rpm.NewModuleWithLogger(&worker{logger: logger, index: 0}, logger); err != nil {
 		logger.Print(err)
 		return
