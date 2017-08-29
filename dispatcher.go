@@ -85,7 +85,14 @@ func (dispatcher *downstreamDispatcher) receiver() {
 		for {
 			if reply, err := conn.Receive(); err != nil {
 				/* shouldn't happen */
-				panic(err)
+				if redisErr, ok := err.(redis.Error); ok {
+					pending.error(err)
+					if pending.reply(redisErr) {
+						break
+					}
+				} else {
+					panic(err)
+				}
 			} else {
 				if pending.reply(reply) {
 					break
