@@ -68,7 +68,7 @@ func (client *redisClient) Do(ctx context.Context, command string, args ...inter
 }
 
 func (client *redisClient) DoMulti(ctx context.Context, requests ...[]interface{}) (reply []interface{}, err error) {
-	client.module.downstream.dispatch(&redisRequest{request: requests, response: client.future})
+	client.module.downstream().dispatch(&redisRequest{request: requests, response: client.future})
 	responses := <-client.future
 	return responses.reply, responses.err
 }

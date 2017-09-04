@@ -3,6 +3,7 @@ package rpm
 import (
 	"bufio"
 	"github.com/garyburd/redigo/redis"
+	"net"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -136,20 +137,30 @@ func (dispatcher *downstreamDispatcher) dispatch(item interface{}) {
 	dispatcher.requests <- item.(*redisRequest)
 }
 
-func newDownstreamDispatcher() dispatcher {
+func newDownstreamDispatcher(conn net.Conn) dispatcher {
 	return &downstreamDispatcher{
 		requests: make(chan *redisRequest),
 		pending:  make(chan *redisRequest),
-		conn:     redis.NewConn(downstream, time.Hour*0xFFFF, time.Hour*0xFFFF),
+		conn:     redis.NewConn(conn, time.Hour*0xFFFF, time.Hour*0xFFFF),
 	}
+}
+
+func newDownstreamDispatchers(downstreams []net.Conn) []dispatcher {
+	dispatchers := make([]dispatcher, len(downstreams), len(downstreams))
+	for idx := range dispatchers {
+		dispatchers[idx] = newDownstreamDispatcher(downstreams[idx])
+	}
+	return dispatchers
 }
 
 type responseDispatcher struct {
 	dispatcherLifecycle
 	responses chan []byte
+	upstream  net.Conn
 }
 
 func (dispatcher *responseDispatcher) run() {
+	upstream := dispatcher.upstream
 	for response := range dispatcher.responses {
 		upstream.Write(response)
 	}
@@ -174,15 +185,17 @@ func (dispatcher *responseDispatcher) dispatch(item interface{}) {
 	dispatcher.responses <- item.([]byte)
 }
 
-func newResponseDispatcher() dispatcher {
+func newResponseDispatcher(upstream net.Conn) dispatcher {
 	return &responseDispatcher{
 		responses: make(chan []byte),
+		upstream:  upstream,
 	}
 }
 
 type requestDispatcher struct {
 	dispatcherLifecycle
-	input *bufio.Reader
+	input    *bufio.Reader
+	upstream net.Conn
 }
 
 func (dispatcher *requestDispatcher) run(module *redisModule) {
@@ -208,7 +221,7 @@ func (dispatcher *requestDispatcher) start(module *redisModule) {
 
 func (dispatcher *requestDispatcher) stop() {
 	dispatcher.doStop(func() {
-		upstream.Close()
+		dispatcher.upstream.Close()
 	})
 }
 
@@ -220,8 +233,9 @@ func (dispatcher *requestDispatcher) shutdown() {
 func (dispatcher *requestDispatcher) dispatch(item interface{}) {
 }
 
-func newRequestDispatcher() dispatcher {
+func newRequestDispatcher(upstream net.Conn) dispatcher {
 	return &requestDispatcher{
-		input: bufio.NewReader(upstream),
+		input:    bufio.NewReader(upstream),
+		upstream: upstream,
 	}
 }

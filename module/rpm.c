@@ -24,7 +24,11 @@ error "Only LP64 architectures are supported"
 #define MAX_LOG_LEN (1000) /* leave some room for worker process id in log */
 #define MAX_REAL_LOG_LEN (1024)
 
-#define ENV_RPM_DOWNSTREAM_FD "RPM_DOWNSTREAM_FD"
+#define RPM_DEFAULT_DOWNSTREAM (4)
+#define RPM_MAX_DOWNSTREAM (16)
+
+#define ENV_RPM_DOWNSTREAM_FD_PREFIX "RPM_DOWNSTREAM_FD"
+#define ENV_RPM_DOWNSTREAM_FD_NUM "RPM_DOWNSTREAM_FD_NUM"
 #define ENV_RPM_UPSTREAM_FD "RPM_UPSTREAM_FD"
 
 const char *RPM_BAD_GATEWAY = "-ERR Bad Gateway";
@@ -88,6 +92,7 @@ struct rpm_context {
   hash_map *command_timeout;
   int event_pipe[2];
   allocator *allocator;
+  int32_t num_downstreams;
 };
 
 struct watchdog {
@@ -125,7 +130,8 @@ struct worker_process {
   worker_pipe out;
   worker_pipe err;
   redis_response_reader *reader;
-  int client;
+  int32_t num_clients;
+  int *clients;
   hash_map *request_id_to_client;
   hash_map *client_id_to_request_id;
   pthread_t watchdog;
@@ -489,23 +495,35 @@ static inline void rpm_worker_redirect_fd(int from, int to) {
 }
 
 static void rpm_worker_process_start(worker_process *worker, char **argv) {
-  long idx, max = sysconf(_SC_OPEN_MAX);
-  char buff[32];
+  long idx, cidx, closefd, max = sysconf(_SC_OPEN_MAX);
+  char buff[32], envbuff[32 + sizeof(ENV_RPM_DOWNSTREAM_FD_PREFIX)];
   for (idx = 1; idx < max; ++idx) {
-    if (idx == worker->upstream.pipe[1] || idx == worker->out.pipe[1] ||
-        idx == worker->err.pipe[1] || idx == worker->client) {
-      continue;
+    closefd = 1;
+    if (idx == worker->upstream.pipe[1] || idx == worker->out.pipe[1] || idx == worker->err.pipe[1]) {
+      closefd = 0;
+    } else {
+      for (cidx = 0; cidx < worker->num_clients; ++cidx) {
+        if (idx == worker->clients[cidx]) {
+          closefd = 0;
+          break;
+        }
+      }
     }
-    close(idx);
+    if (closefd != 0) {
+      close(idx);
+    }
   }
   rpm_worker_redirect_fd(worker->out.pipe[1], STDOUT_FILENO);
   rpm_worker_redirect_fd(worker->err.pipe[1], STDERR_FILENO);
-  rpm_worker_redirect_fd(worker->client, STDERR_FILENO + 1);
-  snprintf(buff, sizeof(buff), "%d", STDERR_FILENO + 1);
-  setenv(ENV_RPM_DOWNSTREAM_FD, buff, 1);
-  rpm_worker_redirect_fd(worker->upstream.pipe[1], STDERR_FILENO + 2);
-  snprintf(buff, sizeof(buff), "%d", STDERR_FILENO + 2);
+  snprintf(buff, sizeof(buff), "%d", worker->upstream.pipe[1]);
   setenv(ENV_RPM_UPSTREAM_FD, buff, 1);
+  snprintf(buff, sizeof(buff), "%d", worker->num_clients);
+  setenv(ENV_RPM_DOWNSTREAM_FD_NUM, buff, 1);
+  for (cidx = 0; cidx < worker->num_clients; ++cidx) {
+    snprintf(envbuff, sizeof(envbuff), "%s[%ld]", ENV_RPM_DOWNSTREAM_FD_PREFIX, cidx);
+    snprintf(buff, sizeof(buff), "%d", worker->clients[cidx]);
+    setenv(envbuff, buff, 1);
+  }
   execvp(argv[0], argv);
   exit(1);
 }
@@ -545,6 +563,7 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, worker_process *worker) {
   /* send worker dead error to pending requests of current worker */
   int64_t request_id;
   size_t ignored;
+  int32_t idx;
   RedisModuleBlockedClient *bc = NULL;
   hash_map_iterator *iterator = hash_map_iterator_create(worker->request_id_to_client);
   while (hash_map_iterator_next(iterator) != 0) {
@@ -554,8 +573,14 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, worker_process *worker) {
   hash_map_iterator_destroy(iterator);
   hash_map_destroy(worker->request_id_to_client);
   hash_map_destroy(worker->client_id_to_request_id);
-  if (worker->client != 0) {
-    close(worker->client);
+  if (worker->clients != NULL) {
+    for (idx = 0; idx < worker->num_clients; ++idx) {
+      if (worker->clients[idx] != 0) {
+        close(worker->clients[idx]);
+        worker->clients[idx] = 0;
+      }
+    }
+    RedisModule_Free(worker->clients);
   }
   rpm_worker_close_pipe(ctx, &worker->upstream);
   rpm_worker_close_pipe(ctx, &worker->out);
@@ -567,12 +592,23 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, worker_process *worker) {
 }
 
 static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) {
+  int32_t idx;
   worker_process *worker = RedisModule_Calloc(1, sizeof(worker_process));
   worker->reader = redis_response_reader_create(rpm->allocator, 1024 * 1024);
   worker->request_id_to_client = hash_map_create(&int_key_map, 1024);
   worker->client_id_to_request_id = hash_map_create(&int_key_map, 1024);
-  if (RedisModule_CreateClient(ctx, &worker->client) != REDISMODULE_OK ||
-      rpm_worker_pipe_init(ctx, worker, &worker->upstream, rpm_worker_upstream_read, 1) ||
+  worker->num_clients = rpm->num_downstreams;
+  if ((worker->clients = RedisModule_Calloc(1, sizeof(worker->clients[0]) * worker->num_clients)) == NULL) {
+    rpm_worker_destroy(ctx, worker);
+    return NULL;
+  }
+  for (idx = 0; idx < worker->num_clients; ++idx) {
+    if (RedisModule_CreateClient(ctx, worker->clients + idx) != REDISMODULE_OK) {
+      rpm_worker_destroy(ctx, worker);
+      return NULL;
+    }
+  }
+  if (rpm_worker_pipe_init(ctx, worker, &worker->upstream, rpm_worker_upstream_read, 1) ||
       rpm_worker_pipe_init(ctx, worker, &worker->out, rpm_worker_stdout_read, 0) ||
       rpm_worker_pipe_init(ctx, worker, &worker->err, rpm_worker_stderr_read, 0)) {
     rpm_worker_destroy(ctx, worker);
@@ -587,8 +623,12 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
     worker->out.pipe[1] = 0;
     close(worker->err.pipe[1]);
     worker->err.pipe[1] = 0;
-    close(worker->client);
-    worker->client = 0;
+    for (idx = 0; idx < worker->num_clients; ++idx) {
+      if (worker->clients[idx] != 0) {
+        close(worker->clients[idx]);
+        worker->clients[idx] = 0;
+      }
+    }
     setpgid(worker->pid, 0);
     watchdog *watchdog = RedisModule_Alloc(sizeof(watchdog));
     watchdog->target = worker->pid;
@@ -632,7 +672,12 @@ static rpm_context *rpm_context_create(RedisModuleCtx *ctx, int argc, RedisModul
     rpm_allocator_realloc, rpm_allocator_free, rpm_allocator_destroy, rpm);
   for (idx = 0; idx + 1 < argc; ++idx) {
     arg = RedisModule_StringPtrLen(argv[idx], &len);
-    if (strcasecmp("--command", arg) == 0) {
+    if (strcasecmp("--num-downstreams", arg) == 0) {
+      /* consume the next argument */
+      arg = RedisModule_StringPtrLen(argv[++idx], &len);
+      rpm->num_downstreams = strtol(arg, NULL, 10);
+      last_is_command = 0;
+    } else if (strcasecmp("--command", arg) == 0) {
       /* consume the next argument */
       arg = RedisModule_StringPtrLen(argv[++idx], &len);
       if (RedisModule_CreateCommand(ctx, arg, rpm_worker_upstream_write_command, "", 0, 0, 0) == REDISMODULE_ERR) {
@@ -672,6 +717,11 @@ static rpm_context *rpm_context_create(RedisModuleCtx *ctx, int argc, RedisModul
 
   if (pipe(rpm->event_pipe) != 0) {
     goto cleanup_exit;
+  }
+  if (rpm->num_downstreams <= 0) {
+    rpm->num_downstreams = RPM_DEFAULT_DOWNSTREAM;
+  } else if (rpm->num_downstreams > RPM_MAX_DOWNSTREAM) {
+    rpm->num_downstreams = RPM_MAX_DOWNSTREAM;
   }
   RedisModule_EnableNonBlock(ctx, rpm->event_pipe[0]);
   RedisModule_CreateFileEvent(ctx, rpm->event_pipe[0], REDISMODULE_READ, rpm_event_read, rpm);
