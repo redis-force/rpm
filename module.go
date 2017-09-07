@@ -21,8 +21,8 @@ type contextKey int
 var sessionIdKey contextKey = 0
 
 type redisModule struct {
-	request        dispatcher
-	response       dispatcher
+	requests       []dispatcher
+	responses      []dispatcher
 	downstreams    []dispatcher
 	worker         RedisModuleWorker
 	logger         *log.Logger
@@ -34,23 +34,23 @@ func (module *redisModule) downstream() dispatcher {
 	return module.downstreams[atomic.AddUint32(&module.downstreamId, 1)%module.numDownstreams]
 }
 
-func (module *redisModule) panicHandler(id int64) {
+func (module *redisModule) panicHandler(client, id int64) {
 	if r := recover(); r != nil {
 		msg := fmt.Sprintf("Failed to dispatch request %v:%v\n%s", id, r, string(debug.Stack()))
 		module.logger.Print(msg)
 		response := newResponse(id)
 		response.WriteError("ERR Internal")
-		module.response.dispatch(response.serialize())
+		module.responses[client%int64(len(module.responses))].dispatch(response.serialize())
 	}
 }
 
-func (module *redisModule) onRequest(client int64, id int64, request [][]byte) {
+func (module *redisModule) onRequest(client, id int64, request [][]byte) {
 	response := newResponse(id)
 	go func() {
-		defer module.panicHandler(id)
+		defer module.panicHandler(client, id)
 		ctx := context.WithValue(context.Background(), sessionIdKey, client)
 		module.worker.OnCommand(ctx, module.NewRedisClient(), request, response)
-		module.response.dispatch(response.serialize())
+		module.responses[client%int64(len(module.responses))].dispatch(response.serialize())
 	}()
 }
 
@@ -58,38 +58,46 @@ func (module *redisModule) onError(err error) {
 	module.worker.OnError(context.Background(), err)
 }
 
+func (module *redisModule) start(d dispatcher) {
+	d.start(module)
+}
+
 func (module *redisModule) Start() {
-	for _, downstream := range module.downstreams {
-		downstream.start(module)
-	}
-	module.response.start(module)
-	module.request.start(module)
+	forEachDispatcher(module.downstreams, module.start)
+	forEachDispatcher(module.responses, module.start)
+	forEachDispatcher(module.requests, module.start)
 	module.worker.OnStart(context.Background(), module.NewRedisClient())
+}
+
+func (module *redisModule) stop(d dispatcher) {
+	d.stop()
 }
 
 func (module *redisModule) Stop() {
 	module.worker.OnStop(context.Background(), module.NewRedisClient())
-	module.request.stop()
-	module.response.stop()
-	for _, downstream := range module.downstreams {
-		downstream.stop()
-	}
+	forEachDispatcher(module.requests, module.stop)
+	forEachDispatcher(module.responses, module.stop)
+	forEachDispatcher(module.downstreams, module.stop)
+}
+
+func (module *redisModule) shutdown(d dispatcher) {
+	d.shutdown()
 }
 
 func (module *redisModule) Shutdown() {
-	for _, downstream := range module.downstreams {
-		downstream.shutdown()
-	}
-	module.response.shutdown()
-	module.request.shutdown()
+	forEachDispatcher(module.downstreams, module.shutdown)
+	forEachDispatcher(module.responses, module.shutdown)
+	forEachDispatcher(module.requests, module.shutdown)
+}
+
+func (module *redisModule) join(d dispatcher) {
+	d.join()
 }
 
 func (module *redisModule) Join() {
-	for _, downstream := range module.downstreams {
-		downstream.join()
-	}
-	module.response.join()
-	module.request.join()
+	forEachDispatcher(module.downstreams, module.join)
+	forEachDispatcher(module.responses, module.join)
+	forEachDispatcher(module.requests, module.join)
 }
 
 func (module *redisModule) NewRedisClient() RedisClient {
@@ -134,12 +142,12 @@ func newModule(worker RedisModuleWorker, logger *log.Logger) (RedisModule, error
 		return moduleInstance, nil
 	}
 	var err error
-	var upstream net.Conn
+	var upstreams []net.Conn
 	var downstreams []net.Conn
 	if downstreams, err = connectToMany("RPM_DOWNSTREAM_FD_NUM", "RPM_DOWNSTREAM_FD[%d]"); err != nil {
 		return nil, err
 	}
-	if upstream, err = connectTo("RPM_UPSTREAM_FD"); err != nil {
+	if upstreams, err = connectToMany("RPM_UPSTREAM_FD_NUM", "RPM_UPSTREAM_FD[%d]"); err != nil {
 		return nil, err
 	}
 
@@ -147,8 +155,8 @@ func newModule(worker RedisModuleWorker, logger *log.Logger) (RedisModule, error
 		worker:         worker,
 		logger:         logger,
 		downstreams:    newDownstreamDispatchers(downstreams),
-		response:       newResponseDispatcher(upstream),
-		request:        newRequestDispatcher(upstream),
+		responses:      newResponseDispatchers(upstreams),
+		requests:       newRequestDispatchers(upstreams),
 		numDownstreams: uint32(len(downstreams)),
 	}, nil
 }

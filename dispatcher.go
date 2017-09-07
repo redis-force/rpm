@@ -18,6 +18,12 @@ type dispatcher interface {
 	dispatch(item interface{})
 }
 
+func forEachDispatcher(dispatchers []dispatcher, f func(dispatcher)) {
+	for _, dispatcher := range dispatchers {
+		f(dispatcher)
+	}
+}
+
 type dispatcherLifecycle struct {
 	running int32
 	wait    sync.WaitGroup
@@ -192,6 +198,14 @@ func newResponseDispatcher(upstream net.Conn) dispatcher {
 	}
 }
 
+func newResponseDispatchers(upstreams []net.Conn) []dispatcher {
+	dispatchers := make([]dispatcher, len(upstreams), len(upstreams))
+	for idx := range dispatchers {
+		dispatchers[idx] = newResponseDispatcher(upstreams[idx])
+	}
+	return dispatchers
+}
+
 type requestDispatcher struct {
 	dispatcherLifecycle
 	input    *bufio.Reader
@@ -238,4 +252,12 @@ func newRequestDispatcher(upstream net.Conn) dispatcher {
 		input:    bufio.NewReader(upstream),
 		upstream: upstream,
 	}
+}
+
+func newRequestDispatchers(upstreams []net.Conn) []dispatcher {
+	dispatchers := make([]dispatcher, len(upstreams), len(upstreams))
+	for idx := range dispatchers {
+		dispatchers[idx] = newRequestDispatcher(upstreams[idx])
+	}
+	return dispatchers
 }
