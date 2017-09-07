@@ -193,6 +193,7 @@ static void rpm_worker_upstream_buffer_write(RedisModuleCtx *ctx, int fd, void *
   pipe->num_buffers -= count;
   if (pipe->read_buffer == NULL) {
     rpm_worker_pipe_buffer_reset(pipe);
+    RedisModule_DeleteFileEvent(ctx, fd, REDISMODULE_WRITE);
   }
 }
 
