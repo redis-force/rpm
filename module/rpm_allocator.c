@@ -9,14 +9,14 @@ typedef void *(*allocator_realloc_fn)(void *, void *, size_t);
 typedef void (*allocator_free_fn)(void *, void *);
 typedef void (*allocator_destroy_fn)(void *);
 
-typedef struct allocator {
+struct allocator {
   allocator_malloc_fn malloc;
   allocator_realloc_fn realloc;
   allocator_malloc_fn calloc;
   allocator_free_fn free;
   allocator_destroy_fn destroy;
   void *impl;
-} allocator;
+};
 
 void *allocator_malloc(allocator *allocator, size_t size) {
   return allocator->malloc(allocator->impl, size);

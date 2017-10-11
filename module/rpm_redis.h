@@ -4,8 +4,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include "rpm_allocator.h"
+#include "rpm_chained_buffer.h"
 
-typedef struct chained_buffer chained_buffer;
 typedef struct redis_response_reader redis_response_reader;
 typedef struct redis_response redis_response;
 

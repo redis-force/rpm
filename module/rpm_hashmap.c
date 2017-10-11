@@ -62,23 +62,23 @@ typedef struct hash_table {
   size_t used;
 } hash_table;
 
-typedef struct hash_map {
+struct hash_map {
   hash_map_type type;
   int32_t options;
   size_t initial_size;
   hash_table tables[2];
   int64_t rehash_index; /* this can make sure rehash number never overflow unless we can really use up whole 64bits address space */
   size_t iterators;
-} hash_map;
+};
 
-typedef struct hash_map_iterator {
+struct hash_map_iterator {
   hash_map *map;
   size_t table;
   int64_t index;
   hash_map_entry *current;
   hash_map_entry *next;
   uint8_t safe;
-} hash_map_iterator;
+};
 
 /* implementation details */
 static void hash_table_reset(hash_table *table);

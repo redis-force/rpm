@@ -15,7 +15,7 @@ endif
 all: rpm.so
 
 .c.xo:
-	$(CC) -DREDISMODULE_EXPERIMENTAL_API -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
+	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
 
 RPM_OBJECTS = rpm.xo rpm_allocator.xo rpm_chained_buffer.xo rpm_hashmap.xo rpm_redis.xo
 
