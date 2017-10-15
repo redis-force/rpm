@@ -162,36 +162,40 @@ func consumeAllQuota(stack []int) []int {
 }
 
 type moduleResponse struct {
-	id         int64
 	response   *bytes.Buffer
 	lenBuffer  [32]byte
 	numBuffer  [40]byte
 	quotaStack []int
 }
 
-func newResponse(id int64) *moduleResponse {
-	var header [44]byte
-	header[43] = '\n'
-	header[42] = '\r'
-	idx := 41
-	number := id
+func writeInt64ToBuffer(prefix byte, n int64, buffer []byte) int {
+	idx := len(buffer) - 1
+	buffer[idx] = '\n'
+	buffer[idx-1] = '\r'
+	idx = idx - 2
 	for {
-		header[idx] = byte('0' + number%10)
+		buffer[idx] = byte('0' + n%10)
 		idx -= 1
-		number = number / 10
-		if number == 0 {
+		n = n / 10
+		if n == 0 {
 			break
 		}
 	}
-	header[idx] = ':'
+	buffer[idx] = prefix
+	return len(buffer) - idx
+}
+
+func newResponse(clientId, requestId int64) *moduleResponse {
+	var header [80]byte
+	idx := len(header) - writeInt64ToBuffer(':', requestId, header[:])
+	idx -= writeInt64ToBuffer(':', clientId, header[:idx])
 	header[idx-1] = '\n'
 	header[idx-2] = '\r'
-	header[idx-3] = '2'
+	header[idx-3] = '3'
 	header[idx-4] = '*'
-
+	slice := header[idx-4:]
 	return &moduleResponse{
-		id:         id,
-		response:   bytes.NewBuffer(header[idx-4:]),
+		response:   bytes.NewBuffer(slice),
 		quotaStack: newQuotaStack(),
 	}
 }
@@ -218,19 +222,8 @@ func (response *moduleResponse) serialize() []byte {
 }
 
 func (response *moduleResponse) writeLen(prefix byte, n int) error {
-	response.lenBuffer[len(response.lenBuffer)-1] = '\n'
-	response.lenBuffer[len(response.lenBuffer)-2] = '\r'
-	i := len(response.lenBuffer) - 3
-	for {
-		response.lenBuffer[i] = byte('0' + n%10)
-		i -= 1
-		n = n / 10
-		if n == 0 {
-			break
-		}
-	}
-	response.lenBuffer[i] = prefix
-	_, err := response.response.Write(response.lenBuffer[i:])
+	idx := len(response.lenBuffer) - writeInt64ToBuffer(prefix, int64(n), response.lenBuffer[:])
+	_, err := response.response.Write(response.lenBuffer[idx:])
 	return err
 }
 

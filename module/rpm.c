@@ -37,8 +37,8 @@ error "Only LP64 architectures are supported"
 #define ENV_RPM_UPSTREAM_FD_PREFIX "RPM_UPSTREAM_FD"
 #define ENV_RPM_UPSTREAM_FD_NUM "RPM_UPSTREAM_FD_NUM"
 
-const char *RPM_BAD_GATEWAY = "-ERR Bad Gateway";
-const char *RPM_REQUEST_TIMEOUT = "-ERR Request Timeout";
+const char *RPM_BAD_GATEWAY = "ERR Bad Gateway";
+const char *RPM_REQUEST_TIMEOUT = "ERR Request Timeout";
 const int64_t RPM_DEFAULT_TIMEOUT = 1000;
 
 typedef enum rpm_event_type {
@@ -288,7 +288,7 @@ static int rpm_worker_command_on_reply(RedisModuleCtx *ctx, RedisModuleString **
     RedisModule_ReplyWithError(ctx, RPM_BAD_GATEWAY);
   } else {
     redis_response *reply = data;
-    rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[1]);
+    rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[2]);
   }
   return 0;
 }
@@ -404,20 +404,25 @@ static void rpm_worker_log_flush(RedisModuleCtx *ctx, worker_pipe *pipe, const c
   RedisModule_Log(ctx, level, log_buffer);
 }
 
-static void rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *reply) {
-  redis_response *first;
+static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *reply) {
+  redis_response *client_id, *request_id;
   rpm_context *rpm = rpm_context_get(ctx);
-  assert(reply->type == REDIS_RESPONSE_ARRAY && reply->payload.array.length == 2);
-  first = reply->payload.array.array[0];
-  assert(first->type == REDIS_RESPONSE_INTEGER);
-  if ((reply = rpm_worker_process_reply(rpm, RedisModule_GetClientId(ctx), first->payload.integer, reply)) != NULL) {
+  if (reply->type != REDIS_RESPONSE_ARRAY || reply->payload.array.length != 3 || 
+      reply->payload.array.array[0]->type != REDIS_RESPONSE_INTEGER ||
+      reply->payload.array.array[1]->type != REDIS_RESPONSE_INTEGER) {
+    return REDIS_RESPONSE_ERROR_PROTOCOL;
+  }
+  client_id = reply->payload.array.array[0];
+  request_id = reply->payload.array.array[1];
+  if ((reply = rpm_worker_process_reply(rpm, client_id->payload.integer, request_id->payload.integer, reply)) != NULL) {
     redis_response_reader_free_response(reply);
   }
+  return REDIS_RESPONSE_OK;
 }
 
 static void rpm_worker_upstream_read(RedisModuleCtx *ctx, int fd, void *client_data, int mask) {
   int rd;
-  redis_response_status st;
+  redis_response_status st = REDIS_RESPONSE_OK;
   worker_pipe *pipe = client_data;
   worker_process *worker = pipe->worker;
   redis_response_reader *reader = pipe->user_data;
@@ -426,8 +431,8 @@ static void rpm_worker_upstream_read(RedisModuleCtx *ctx, int fd, void *client_d
   REDISMODULE_NOT_USED(mask);
   while ((rd = read(fd, buf, sizeof(worker->buf))) > 0) {
     redis_response_reader_feed(reader, buf, rd);
-    while ((st = redis_response_reader_next(reader, &reply)) == REDIS_RESPONSE_OK && reply != NULL) {
-      rpm_worker_upstream_on_reply(ctx, reply);
+    while (st == REDIS_RESPONSE_OK && (st = redis_response_reader_next(reader, &reply)) == REDIS_RESPONSE_OK && reply != NULL) {
+      st = rpm_worker_upstream_on_reply(ctx, reply);
     }
     if (st != REDIS_RESPONSE_OK) {
       /* protocol error, kill worker and restart to fix the channel */

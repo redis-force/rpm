@@ -34,23 +34,23 @@ func (module *redisModule) downstream() dispatcher {
 	return module.downstreams[atomic.AddUint32(&module.downstreamId, 1)%module.numDownstreams]
 }
 
-func (module *redisModule) panicHandler(client, id int64) {
+func (module *redisModule) panicHandler(clientId, requestId int64) {
 	if r := recover(); r != nil {
-		msg := fmt.Sprintf("Failed to dispatch request %v:%v\n%s", id, r, string(debug.Stack()))
+		msg := fmt.Sprintf("Failed to dispatch request %v from client %v:%v\n%s", requestId, clientId, r, string(debug.Stack()))
 		module.logger.Print(msg)
-		response := newResponse(id)
+		response := newResponse(clientId, requestId)
 		response.WriteError("ERR Internal")
-		module.responses[client%int64(len(module.responses))].dispatch(response.serialize())
+		module.responses[clientId%int64(len(module.responses))].dispatch(response.serialize())
 	}
 }
 
-func (module *redisModule) onRequest(client, id int64, request [][]byte) {
-	response := newResponse(id)
+func (module *redisModule) onRequest(clientId, requestId int64, request [][]byte) {
+	response := newResponse(clientId, requestId)
 	go func() {
-		defer module.panicHandler(client, id)
-		ctx := context.WithValue(context.Background(), sessionIdKey, client)
+		defer module.panicHandler(clientId, requestId)
+		ctx := context.WithValue(context.Background(), sessionIdKey, clientId)
 		module.worker.OnCommand(ctx, module.NewRedisClient(), request, response)
-		module.responses[client%int64(len(module.responses))].dispatch(response.serialize())
+		module.responses[clientId%int64(len(module.responses))].dispatch(response.serialize())
 	}()
 }
 
