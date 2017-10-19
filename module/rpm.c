@@ -401,7 +401,7 @@ static void rpm_worker_log_flush(RedisModuleCtx *ctx, worker_pipe *pipe, const c
     offset += 6;
   }
   log_buffer[offset] = '\0';
-  RedisModule_Log(ctx, level, log_buffer);
+  RedisModule_Log(ctx, level, "%s", log_buffer);
 }
 
 static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *reply) {
