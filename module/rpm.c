@@ -658,7 +658,9 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_pro
   }
   rpm_worker_close_pipe(ctx, &worker->out);
   rpm_worker_close_pipe(ctx, &worker->err);
-  pthread_join(worker->watchdog, &tmp);
+  if (worker->watchdog) {
+    pthread_join(worker->watchdog, &tmp);
+  }
   RedisModule_Log(ctx, "warning", "worker process %lld is terminated prematurely, a new worker is being spawned", worker->pid);
   RedisModule_Free(worker);
   if (++rpm->restart_count >= rpm->retry_attempts) {
