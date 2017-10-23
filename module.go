@@ -34,9 +34,9 @@ func (module *redisModule) downstream() dispatcher {
 	return module.downstreams[atomic.AddUint32(&module.downstreamId, 1)%module.numDownstreams]
 }
 
-func (module *redisModule) panicHandler(clientId, requestId int64) {
+func (module *redisModule) panicHandler(clientId, requestId int64, cmd []byte) {
 	if r := recover(); r != nil {
-		msg := fmt.Sprintf("Failed to dispatch request %v from client %v:%v\n%s", requestId, clientId, r, string(debug.Stack()))
+		msg := fmt.Sprintf("Failed to dispatch request %v(%v) from client %v:%v\n%s", cmd, requestId, clientId, r, string(debug.Stack()))
 		module.logger.Print(msg)
 		response := newResponse(clientId, requestId)
 		response.WriteError("ERR Internal")
@@ -47,7 +47,7 @@ func (module *redisModule) panicHandler(clientId, requestId int64) {
 func (module *redisModule) onRequest(clientId, requestId int64, request [][]byte) {
 	response := newResponse(clientId, requestId)
 	go func() {
-		defer module.panicHandler(clientId, requestId)
+		defer module.panicHandler(clientId, requestId, request[0])
 		ctx := context.WithValue(context.Background(), sessionIdKey, clientId)
 		module.worker.OnCommand(ctx, module.NewRedisClient(), request, response)
 		module.responses[clientId%int64(len(module.responses))].dispatch(response.serialize())
