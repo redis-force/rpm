@@ -627,6 +627,8 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_pro
   size_t ignored;
   int32_t idx;
   RedisModuleBlockedClient *bc = NULL;
+  redis_response_reader *reader;
+
   hash_map_iterator *iterator = hash_map_iterator_create(worker->request_id_to_client);
   while (hash_map_iterator_next(iterator) != 0) {
     hash_map_iterator_get(iterator, (const void **) &request_id, &ignored, (const void **) &bc, &ignored);
@@ -652,7 +654,9 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_pro
   }
   if (worker->readers != NULL) {
     for (idx = 0; idx < worker->num_upstreams; ++idx) {
-      redis_response_reader_free(worker->readers[idx]);
+      if ((reader = worker->readers[idx]) != NULL) {
+        redis_response_reader_free(reader);
+      }
     }
     RedisModule_Free(worker->readers);
   }
