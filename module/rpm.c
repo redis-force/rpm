@@ -213,7 +213,9 @@ static void rpm_worker_upstream_buffer_write(RedisModuleCtx *ctx, int fd, void *
     available = current->size - current->offset;
     if ((wr = write(fd, current->buffer + current->offset, available)) < available) {
       /* there are data leftover inside current buffer */
-      current->offset += wr;
+      if (wr > 0) {
+        current->offset += wr;
+      }
       break;
     }
     ++count;
@@ -243,7 +245,9 @@ static void rpm_worker_upstream_write(RedisModuleCtx *ctx, worker_pipe *pipe, in
       chained_buffer_destroy(&buf, 1);
       return;
     }
-    buf->offset += wr;
+    if (wr > 0) {
+      buf->offset += wr;
+    }
   }
   rpm_worker_upstream_buffer_data(ctx, pipe, to, buf);
   return;
