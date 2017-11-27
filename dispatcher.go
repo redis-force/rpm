@@ -2,6 +2,7 @@ package rpm
 
 import (
 	"bufio"
+	"fmt"
 	"github.com/garyburd/redigo/redis"
 	"net"
 	"strconv"
@@ -224,6 +225,8 @@ func (dispatcher *requestDispatcher) run(module *redisModule) {
 				}
 				continue
 			}
+		} else {
+			panic(fmt.Sprintf("Suicide because it can not be recovered from error: %v", err))
 		}
 		module.onError(err)
 	}

@@ -24,8 +24,11 @@ func readLine(input *bufio.Reader) ([]byte, error) {
 		return nil, err
 	}
 	i := len(slice) - 2
-	if i < 0 || slice[i] != '\r' {
-		return nil, protocolError("bad response line terminator")
+	if i < 0 {
+		return nil, protocolError(fmt.Sprintf("bad response line terminator. length of line %d is shorter than 2", i+2))
+	}
+	if slice[i] != '\r' {
+		return nil, protocolError(fmt.Sprintf("bad response line terminator. The second last character '%x' is not \\r", slice[i]))
 	}
 	return slice[:i], nil
 }
@@ -90,7 +93,7 @@ func readBulkString(input *bufio.Reader) ([]byte, error) {
 		return nil, protocolError("short response line")
 	}
 	if line[0] != '$' {
-		return nil, protocolError("command not in correct format")
+		return nil, protocolError(fmt.Sprintf("command not in correct format, got type '%x'", line[0]))
 	}
 	length, err := parseLen(line[1:])
 	if length < 0 || err != nil {
@@ -115,7 +118,7 @@ func newRequest(input *bufio.Reader) ([][]byte, error) {
 		return nil, protocolError("short request line")
 	}
 	if line[0] != '*' {
-		return nil, protocolError("command not in correct format")
+		return nil, protocolError(fmt.Sprintf("command not in correct format, got type '%x'", line[0]))
 	}
 	size, err := parseLen(line[1:])
 	if size < 0 || err != nil {

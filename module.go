@@ -47,7 +47,7 @@ func (module *redisModule) commandCleanup(clientId, requestId int64, cmd []byte,
 	}
 	elapsed := time.Now().Sub(startTime)
 	if elapsed > slowCommandThreshold {
-		module.logger.Print("Slow command: %v(%v) from client %v took %v\n", cmd, requestId, clientId, elapsed)
+		module.logger.Printf("Slow command: %v(%v) from client %v took %v\n", cmd, requestId, clientId, elapsed)
 	}
 }
 
