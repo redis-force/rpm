@@ -244,7 +244,7 @@ func (response *moduleResponse) WriteBytes(p []byte) error {
 }
 
 func (response *moduleResponse) WriteError(msg string) error {
-	response.consumeAllQuota()
+	response.consumeQuota()
 	response.response.WriteByte('-')
 	_, err := response.response.WriteString(msg)
 	if err != nil {
