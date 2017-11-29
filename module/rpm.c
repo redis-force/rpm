@@ -630,7 +630,7 @@ static void *rpm_worker_watchdog(void *arg) {
   watchdog *watch = arg;
   rpm_watchdog_event *event = RedisModule_Alloc(sizeof(rpm_watchdog_event));
   event->type = RPM_EVENT_WATCHDOG;
-  event->target = waitpid(watch->target, &event->stat, 0);
+  while ((event->target = waitpid(watch->target, &event->stat, 0)) != watch->target) {};
   rpm_event_submit(watch->notify, event);
   RedisModule_Free(watch);
   return NULL;
