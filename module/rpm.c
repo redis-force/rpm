@@ -523,8 +523,11 @@ static void rpm_event_free(RedisModuleCtx *ctx, rpm_event *event, void *client_d
 
 static void rpm_event_dispatch(RedisModuleCtx *ctx, rpm_event *event, void *client_data) {
   rpm_context *rpm = rpm_context_get(ctx);
+  rpm_watchdog_event *watchdog;
   switch (event->type) {
     case RPM_EVENT_WATCHDOG:
+      watchdog = (rpm_watchdog_event *) event;
+      RedisModule_Log(ctx, "warning", "Watchdog detected worker process %lld termination", watchdog->target);
       rpm_worker_destroy(ctx, rpm, rpm->worker);
       rpm->worker = rpm_worker_create(ctx, rpm);
       break;
@@ -715,26 +718,31 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
   worker->num_downstreams = rpm->num_downstreams;
   worker->num_upstreams = rpm->num_upstreams;
   if ((worker->downstreams = RedisModule_Calloc(1, sizeof(worker->downstreams[0]) * worker->num_downstreams)) == NULL) {
+    RedisModule_Log(ctx, "warning", "Could not allocate enough memory for downstreams, restart worker again");
     rpm_worker_destroy(ctx, rpm, worker);
     return NULL;
   }
   for (idx = 0; idx < worker->num_downstreams; ++idx) {
     if (RedisModule_CreateClient(ctx, worker->downstreams + idx) != REDISMODULE_OK) {
+      RedisModule_Log(ctx, "warning", "Could not create client for downstream %d, restart worker again", idx);
       rpm_worker_destroy(ctx, rpm, worker);
       return NULL;
     }
   }
   if ((worker->readers = RedisModule_Calloc(1, sizeof(worker->readers[0]) * worker->num_upstreams)) == NULL) {
+    RedisModule_Log(ctx, "warning", "Could not allocate enough memory for response reader, restart worker again");
     rpm_worker_destroy(ctx, rpm, worker);
     return NULL;
   }
   if ((worker->upstreams = RedisModule_Calloc(1, sizeof(worker->upstreams[0]) * worker->num_upstreams)) == NULL) {
+    RedisModule_Log(ctx, "warning", "Could not allocate enough memory for response reader, restart worker again");
     rpm_worker_destroy(ctx, rpm, worker);
     return NULL;
   }
   for (idx = 0; idx < worker->num_upstreams; ++idx) {
     worker->readers[idx] = redis_response_reader_create(rpm->allocator, 1024 * 1024);
     if (rpm_worker_pipe_init(ctx, worker, worker->upstreams + idx, rpm_worker_upstream_read, 1)) {
+      RedisModule_Log(ctx, "warning", "Could not initiate upstream pipe %d, restart worker again");
       rpm_worker_destroy(ctx, rpm, worker);
       return NULL;
     }
@@ -742,6 +750,7 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
   }
   if (rpm_worker_pipe_init(ctx, worker, &worker->out, rpm_worker_stdout_read, 0) ||
       rpm_worker_pipe_init(ctx, worker, &worker->err, rpm_worker_stderr_read, 0)) {
+    RedisModule_Log(ctx, "warning", "Could not initiate stdout and stderr pipe, restart worker again");
     rpm_worker_destroy(ctx, rpm, worker);
     return NULL;
   }
