@@ -173,7 +173,7 @@ struct worker_process {
   hash_map *request_id_to_client;
   hash_map *client_id_to_request_id;
   pthread_t watchdog;
-  char buf[1024];
+  char buf[1024*1024];
 };
 
 static inline void rpm_event_submit(int fd, void *event) {
