@@ -21,7 +21,7 @@ type contextKey int
 
 var sessionIdKey contextKey = 0
 
-const slowCommandThreshold = time.Minute
+const slowCommandThreshold = time.Second * 10
 
 type redisModule struct {
 	requests       []dispatcher

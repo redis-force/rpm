@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 
 #ifndef __LP64__
@@ -41,16 +42,9 @@ const char *RPM_BAD_GATEWAY = "ERR Bad Gateway";
 const char *RPM_REQUEST_TIMEOUT = "ERR Request Timeout";
 const int64_t RPM_DEFAULT_TIMEOUT = 1000;
 
-typedef enum rpm_event_type {
-  RPM_EVENT_WATCHDOG,
-} rpm_event_type;
-
 typedef struct rpm_context rpm_context;
 typedef struct worker_process worker_process;
 typedef struct worker_pipe worker_pipe;
-typedef struct watchdog watchdog;
-typedef struct rpm_event rpm_event;
-typedef struct rpm_watchdog_event rpm_watchdog_event;
 typedef struct rpm_context_config_descriptor rpm_context_config_descriptor;
 
 static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_process *worker);
@@ -82,23 +76,11 @@ static void rpm_allocator_destroy(void *privdata) {
   REDISMODULE_NOT_USED(privdata);
 }
 
-struct rpm_event {
-  int32_t type;
-  char payload[4];
-};
-
-struct rpm_watchdog_event {
-  int32_t type;
-  pid_t target;
-  int stat;
-};
-
 struct rpm_context {
   char **argv;
   int64_t current_request_id;
   worker_process *worker;
   hash_map *command_timeout;
-  int event_pipe[2];
   allocator *allocator;
   int32_t num_downstreams;
   int32_t num_upstreams;
@@ -131,11 +113,6 @@ static const rpm_context_config_descriptor rpm_config_descriptors[] = {
   {NULL, 0, 0, NULL},
 };
 
-struct watchdog {
-  pid_t target;
-  int notify;
-};
-
 static uint32_t int_key_hash_algorithm(hash_map *map, const void *data, size_t size) {
   REDISMODULE_NOT_USED(map);
   REDISMODULE_NOT_USED(size);
@@ -162,24 +139,18 @@ struct worker_pipe {
 };
 
 struct worker_process {
-  pid_t pid;
   worker_pipe out;
   worker_pipe err;
   redis_response_reader **readers;
   int32_t num_downstreams;
   int *downstreams;
   int32_t num_upstreams;
+  int32_t active_upstreams;
   worker_pipe *upstreams;
   hash_map *request_id_to_client;
   hash_map *client_id_to_request_id;
-  pthread_t watchdog;
   char buf[1024*1024];
 };
-
-static inline void rpm_event_submit(int fd, void *event) {
-  uintptr_t ptr = (uintptr_t) event;
-  write(fd, &ptr, sizeof(ptr));
-}
 
 static inline rpm_context *rpm_context_get(RedisModuleCtx *ctx) {
   return RedisModule_GetAttachment(ctx, NULL, 0);
@@ -438,6 +409,7 @@ static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *rep
 
 static void rpm_worker_upstream_read(RedisModuleCtx *ctx, int fd, void *client_data, int mask) {
   int rd;
+  rpm_context *rpm;
   redis_response_status st = REDIS_RESPONSE_OK;
   worker_pipe *pipe = client_data;
   worker_process *worker = pipe->worker;
@@ -452,9 +424,19 @@ static void rpm_worker_upstream_read(RedisModuleCtx *ctx, int fd, void *client_d
     }
     if (st != REDIS_RESPONSE_OK) {
       /* protocol error, kill worker and restart to fix the channel */
-      RedisModule_Log(ctx, "warning", "worker process %lld respond invalid response and will be restarted to fix the state. %s",
-          worker->pid, redis_response_reader_strerr(reader));
+      RedisModule_Log(ctx, "warning", "worker process respond invalid response and will be restarted to fix the state. %s",
+          redis_response_reader_strerr(reader));
       rpm_worker_suicide(ctx, worker);
+    }
+  }
+  if (rd == 0) {
+    /* upstream eof, worker process must be died, restart it automatically */
+    RedisModule_DeleteFileEvent(ctx, fd, REDISMODULE_READ);
+    RedisModule_Log(ctx, "warning", "Upstream connection with fd %d was closed", fd);
+    rpm = rpm_context_get(ctx);
+    if (--worker->active_upstreams <= 0) {
+      RedisModule_Log(ctx, "warning", "All upstream connections were closed, restart worker process now");
+      rpm_worker_destroy(ctx, rpm, worker);
     }
   }
 }
@@ -512,45 +494,12 @@ static void rpm_worker_suicide(RedisModuleCtx *ctx, worker_process *worker) {
   for (idx = 0; idx < worker->num_upstreams; ++idx) {
     rpm_worker_close_pipe(ctx, worker->upstreams + idx);
   }
-  kill(worker->pid, SIGTERM);
-}
-
-static void rpm_event_free(RedisModuleCtx *ctx, rpm_event *event, void *client_data) {
-  REDISMODULE_NOT_USED(ctx);
-  REDISMODULE_NOT_USED(client_data);
-  RedisModule_Free(event);
-}
-
-static void rpm_event_dispatch(RedisModuleCtx *ctx, rpm_event *event, void *client_data) {
-  rpm_context *rpm = rpm_context_get(ctx);
-  rpm_watchdog_event *watchdog;
-  switch (event->type) {
-    case RPM_EVENT_WATCHDOG:
-      watchdog = (rpm_watchdog_event *) event;
-      RedisModule_Log(ctx, "warning", "Watchdog detected worker process %lld termination", watchdog->target);
-      rpm_worker_destroy(ctx, rpm, rpm->worker);
-      rpm->worker = rpm_worker_create(ctx, rpm);
-      break;
-    default:
-      return;
-  }
-  rpm_event_free(ctx, event, client_data);
-}
-
-static void rpm_event_drain(RedisModuleCtx *ctx, int fd, void (*callback)(RedisModuleCtx *, rpm_event *, void *), void *client_data) {
-  uintptr_t events[16];
-  int rd, idx;
-  while ((rd = read(fd, &events, sizeof(events))) > 0) {
-    rd /= sizeof(uintptr_t);
-    for (idx = 0; idx < rd; ++idx) {
-      callback(ctx, (rpm_event *) events[idx], client_data);
+  for (idx = 0; idx < worker->num_downstreams; ++idx) {
+    if (worker->downstreams[idx] != 0) {
+      close(worker->downstreams[idx]);
+      worker->downstreams[idx] = 0;
     }
   }
-}
-
-static void rpm_event_read(RedisModuleCtx *ctx, int fd, void *client_data, int mask) {
-  REDISMODULE_NOT_USED(mask);
-  rpm_event_drain(ctx, fd, rpm_event_dispatch, client_data);
 }
 
 static inline void rpm_worker_redirect_fd(int from, int to) {
@@ -561,14 +510,31 @@ static inline void rpm_worker_redirect_fd(int from, int to) {
   close(from);
 }
 
+static void rpm_worker_process_daemonize() {
+  pid_t pid;
+
+  umask(027);
+  setsid();
+  signal(SIGCHLD, SIG_IGN);
+  signal(SIGHUP, SIG_IGN);
+  if ((pid = fork()) != 0) {
+    if (pid < 0) {
+      exit(1);
+    } else {
+      exit(0);
+    }
+  }
+}
+
 static void rpm_worker_process_start(worker_process *worker, char **argv) {
   long idx, cidx, closefd, max = sysconf(_SC_OPEN_MAX);
   char buff[32], envbuff[32 + sizeof(ENV_RPM_DOWNSTREAM_FD_PREFIX) + sizeof(ENV_RPM_UPSTREAM_FD_PREFIX)];
+  rpm_worker_process_daemonize();
   for (idx = 1; idx < max; ++idx) {
-    closefd = 1;
     if (idx == worker->out.pipe[1] || idx == worker->err.pipe[1]) {
-      closefd = 0;
+      continue;
     }
+    closefd = 1;
     if (closefd != 0) {
       for (cidx = 0; cidx < worker->num_upstreams; ++cidx) {
         if (idx == worker->upstreams[cidx].pipe[1]) {
@@ -605,6 +571,8 @@ static void rpm_worker_process_start(worker_process *worker, char **argv) {
     snprintf(buff, sizeof(buff), "%d", worker->downstreams[cidx]);
     setenv(envbuff, buff, 1);
   }
+  fprintf(stdout, "worker process %lld is spawned and prepare to serve requests\n", (long long) getpid());
+  fflush(stdout);
   execvp(argv[0], argv);
   exit(1);
 }
@@ -629,16 +597,6 @@ static int rpm_worker_pipe_init(RedisModuleCtx *ctx, worker_process *worker, wor
   return REDISMODULE_OK;
 }
 
-static void *rpm_worker_watchdog(void *arg) {
-  watchdog *watch = arg;
-  rpm_watchdog_event *event = RedisModule_Alloc(sizeof(rpm_watchdog_event));
-  event->type = RPM_EVENT_WATCHDOG;
-  while ((event->target = waitpid(watch->target, &event->stat, 0)) != watch->target) {};
-  rpm_event_submit(watch->notify, event);
-  RedisModule_Free(watch);
-  return NULL;
-}
-
 static int rpm_worker_create_later(RedisModuleCtx *ctx, long long id, void *user_data) {
   rpm_context *rpm = user_data;
   REDISMODULE_NOT_USED(id);
@@ -651,7 +609,6 @@ static int rpm_worker_create_later(RedisModuleCtx *ctx, long long id, void *user
 }
 
 static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_process *worker) {
-  void *tmp;
   /* send worker dead error to pending requests of current worker */
   int64_t request_id;
   size_t ignored;
@@ -693,25 +650,23 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_pro
   }
   rpm_worker_close_pipe(ctx, &worker->out);
   rpm_worker_close_pipe(ctx, &worker->err);
-  if (worker->watchdog) {
-    pthread_join(worker->watchdog, &tmp);
-  }
-  RedisModule_Log(ctx, "warning", "worker process %lld is terminated prematurely, a new worker is being spawned", worker->pid);
-  if (worker->pid == 0) {
-    /* failed to create worker during initialization, setup a timer to try it again 10 ms later */
-    RedisModule_CreateTimeEvent(ctx, 10, rpm_worker_create_later, rpm, NULL, &rpm->restart_timer);
-    rpm->restart_count--;
-  }
+  RedisModule_Log(ctx, "warning", "worker process is terminated prematurely, a new worker is being spawned");
+  /* failed to create worker during initialization, setup a timer to try it again 10 ms later */
+  RedisModule_CreateTimeEvent(ctx, 10, rpm_worker_create_later, rpm, NULL, &rpm->restart_timer);
+  rpm->restart_count--;
   RedisModule_Free(worker);
   if (++rpm->restart_count >= rpm->retry_attempts) {
     RedisModule_Log(ctx, "warning", "worker has been stopped %d times within last %d seconds, shutdown redis automatically", rpm->restart_count, rpm->retry_timeout);
     rpm_context_shutdown_redis(ctx, rpm);
   }
+  rpm->worker = NULL;
 }
 
 static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) {
   int32_t idx;
+  int status;
   time_t now;
+  pid_t pid;
   worker_process *worker = RedisModule_Calloc(1, sizeof(worker_process));
   worker->request_id_to_client = hash_map_create(&int_key_map, 1024);
   worker->client_id_to_request_id = hash_map_create(&int_key_map, 1024);
@@ -719,40 +674,35 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
   worker->num_upstreams = rpm->num_upstreams;
   if ((worker->downstreams = RedisModule_Calloc(1, sizeof(worker->downstreams[0]) * worker->num_downstreams)) == NULL) {
     RedisModule_Log(ctx, "warning", "Could not allocate enough memory for downstreams, restart worker again");
-    rpm_worker_destroy(ctx, rpm, worker);
-    return NULL;
+    goto cleanup_exit;
   }
   for (idx = 0; idx < worker->num_downstreams; ++idx) {
     if (RedisModule_CreateClient(ctx, worker->downstreams + idx) != REDISMODULE_OK) {
       RedisModule_Log(ctx, "warning", "Could not create client for downstream %d, restart worker again", idx);
-      rpm_worker_destroy(ctx, rpm, worker);
-      return NULL;
+      goto cleanup_exit;
     }
   }
   if ((worker->readers = RedisModule_Calloc(1, sizeof(worker->readers[0]) * worker->num_upstreams)) == NULL) {
     RedisModule_Log(ctx, "warning", "Could not allocate enough memory for response reader, restart worker again");
-    rpm_worker_destroy(ctx, rpm, worker);
-    return NULL;
+    goto cleanup_exit;
   }
   if ((worker->upstreams = RedisModule_Calloc(1, sizeof(worker->upstreams[0]) * worker->num_upstreams)) == NULL) {
     RedisModule_Log(ctx, "warning", "Could not allocate enough memory for response reader, restart worker again");
-    rpm_worker_destroy(ctx, rpm, worker);
-    return NULL;
+    goto cleanup_exit;
   }
   for (idx = 0; idx < worker->num_upstreams; ++idx) {
     worker->readers[idx] = redis_response_reader_create(rpm->allocator, 1024 * 1024);
     if (rpm_worker_pipe_init(ctx, worker, worker->upstreams + idx, rpm_worker_upstream_read, 1)) {
-      RedisModule_Log(ctx, "warning", "Could not initiate upstream pipe %d, restart worker again");
-      rpm_worker_destroy(ctx, rpm, worker);
-      return NULL;
+      RedisModule_Log(ctx, "warning", "Could not initiate upstream pipe %d, restart worker again", idx);
+      goto cleanup_exit;
     }
     worker->upstreams[idx].user_data = worker->readers[idx];
   }
+  worker->active_upstreams = worker->num_upstreams;
   if (rpm_worker_pipe_init(ctx, worker, &worker->out, rpm_worker_stdout_read, 0) ||
       rpm_worker_pipe_init(ctx, worker, &worker->err, rpm_worker_stderr_read, 0)) {
     RedisModule_Log(ctx, "warning", "Could not initiate stdout and stderr pipe, restart worker again");
-    rpm_worker_destroy(ctx, rpm, worker);
-    return NULL;
+    goto cleanup_exit;
   }
 
   time(&now);
@@ -760,9 +710,19 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
     rpm->restart_count_reset_time = now;
     rpm->restart_count = 0;
   }
-  if ((worker->pid = fork()) == 0) {
+
+  if ((pid = fork()) == 0) {
     rpm_worker_process_start(worker, rpm->argv);
+  } else if (pid == -1) {
+    RedisModule_Log(ctx, "warning", "Could not create new worker process, restart worker again: %s", strerror(errno));
+    goto cleanup_exit;
   } else {
+    status = 0;
+    waitpid(pid, &status, 0);
+    if (WEXITSTATUS(status) != 0) {
+      RedisModule_Log(ctx, "warning", "Could not daemonize worker process, restart worker again: %s", strerror(errno));
+      goto cleanup_exit;
+    }
     for (idx = 0; idx < worker->num_upstreams; ++idx) {
       if (worker->upstreams[idx].pipe[1] != 0) {
         close(worker->upstreams[idx].pipe[1]);
@@ -779,14 +739,11 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
         worker->downstreams[idx] = 0;
       }
     }
-    setpgid(worker->pid, 0);
-    watchdog *watchdog = RedisModule_Alloc(sizeof(watchdog));
-    watchdog->target = worker->pid;
-    watchdog->notify = rpm->event_pipe[1];
-    pthread_create(&worker->watchdog, NULL, rpm_worker_watchdog, watchdog);
-    RedisModule_Log(ctx, "notice", "worker process %lld is spawned and prepare to serve requests", worker->pid);
   }
   return worker;
+cleanup_exit:
+  rpm_worker_destroy(ctx, rpm, worker);
+  return NULL;
 }
 
 static void rpm_context_destroy(RedisModuleCtx *ctx, rpm_context *rpm) {
@@ -801,10 +758,6 @@ static void rpm_context_destroy(RedisModuleCtx *ctx, rpm_context *rpm) {
   if (rpm->restart_timer != -1) {
     RedisModule_DeleteTimeEvent(ctx, rpm->restart_timer);
   }
-  RedisModule_DeleteFileEvent(ctx, rpm->event_pipe[0], REDISMODULE_READ);
-  rpm_event_drain(ctx, rpm->event_pipe[0], rpm_event_free, NULL);
-  close(rpm->event_pipe[0]);
-  close(rpm->event_pipe[1]);
   allocator_destroy(rpm->allocator);
   for (argv = rpm->argv; *argv != NULL; ++argv) {
     RedisModule_Free(*argv);
@@ -897,9 +850,6 @@ static rpm_context *rpm_context_create(RedisModuleCtx *ctx, int argc, RedisModul
   }
   rpm->argv[didx] = NULL;
 
-  if (pipe(rpm->event_pipe) != 0) {
-    goto cleanup_exit;
-  }
   if (rpm->num_downstreams <= 0) {
     rpm->num_downstreams = RPM_DEFAULT_DOWNSTREAM;
   } else if (rpm->num_downstreams > RPM_MAX_DOWNSTREAM) {
@@ -916,8 +866,6 @@ static rpm_context *rpm_context_create(RedisModuleCtx *ctx, int argc, RedisModul
   if (rpm->retry_attempts <= 0) {
     rpm->retry_attempts = 0x7FFFFFFF;
   }
-  RedisModule_EnableNonBlock(ctx, rpm->event_pipe[0]);
-  RedisModule_CreateFileEvent(ctx, rpm->event_pipe[0], REDISMODULE_READ, rpm_event_read, rpm);
   rpm->restart_timer = -1;
   time(&rpm->restart_count_reset_time);
   if ((rpm->worker = rpm_worker_create(ctx, rpm)) == NULL) {
