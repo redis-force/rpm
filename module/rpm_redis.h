@@ -37,6 +37,7 @@ typedef struct redis_array_response {
 
 struct redis_response {
   redis_response_type type;
+  uint64_t receive_time;
   allocator *allocator;
   union {
     redis_integer_response integer;

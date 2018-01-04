@@ -128,17 +128,18 @@ struct rpm_command_profile_data {
 };
 
 static inline unsigned long long rpm_current_us(void);
-static void rpm_log_profile_data(RedisModuleCtx *ctx, redis_response *client_id,
+static void rpm_log_profile_data(RedisModuleCtx *ctx, uint64_t receive_time, redis_response *client_id,
     redis_response *request_id, redis_response *profile, const char *state) {
   struct rpm_command_profile_data *real_profile = (struct rpm_command_profile_data *) profile->payload.string.str;
   if (profile->payload.string.length < sizeof(struct rpm_command_profile_data)) {
     RedisModule_Log(ctx, "warning", "invalid profile data for client %lld command %lld");
   } else {
-    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s with %u bytes payload: 0/%u/%u/%u/%u/%llu",
+    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s with %u bytes payload: 0/%u/%u/%u/%u/%llu/%llu",
         client_id->payload.integer, request_id->payload.integer, (long long) real_profile->command_start_time, state,
         real_profile->serialized_size, real_profile->worker_start_offset, real_profile->worker_process_offset,
         real_profile->worker_serialize_offset, real_profile->worker_send_offset,
-        rpm_current_us() - (unsigned long long) real_profile->command_start_time);
+        (unsigned long long) (receive_time - real_profile->command_start_time),
+        (unsigned long long) (rpm_current_us() - real_profile->command_start_time));
   }
 }
 
@@ -296,7 +297,7 @@ static int rpm_worker_command_on_reply(RedisModuleCtx *ctx, RedisModuleString **
   } else {
     rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[3]);
     if (rpm->debug_mode) {
-      rpm_log_profile_data(ctx, reply->payload.array.array[0], reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
+      rpm_log_profile_data(ctx, reply->receive_time, reply->payload.array.array[0], reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
     }
   }
   return 0;
@@ -453,9 +454,10 @@ static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *rep
   }
   client_id = reply->payload.array.array[0];
   request_id = reply->payload.array.array[1];
+  reply->receive_time = rpm_current_us();
   if ((reply = rpm_worker_process_reply(rpm, client_id->payload.integer, request_id->payload.integer, reply)) != NULL) {
     if (rpm->debug_mode) {
-      rpm_log_profile_data(ctx, client_id, request_id, reply->payload.array.array[2], "timeout");
+      rpm_log_profile_data(ctx, reply->receive_time, client_id, request_id, reply->payload.array.array[2], "timeout");
     }
     redis_response_reader_free_response(reply);
   }
