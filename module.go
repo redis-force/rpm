@@ -37,11 +37,11 @@ func (module *redisModule) downstream() dispatcher {
 	return module.downstreams[atomic.AddUint32(&module.downstreamId, 1)%module.numDownstreams]
 }
 
-func (module *redisModule) commandCleanup(clientId, requestId int64, cmd []byte, startTime time.Time) {
+func (module *redisModule) commandCleanup(clientId, requestId int64, cmd []byte, commandTimestamp int64, startTime time.Time) {
 	if r := recover(); r != nil {
 		msg := fmt.Sprintf("Failed to dispatch request %v(%v) from client %v:%v\n%s", cmd, requestId, clientId, r, string(debug.Stack()))
 		module.logger.Print(msg)
-		response := newResponse(clientId, requestId)
+		response := newResponse(clientId, requestId, commandTimestamp, startTime.UnixNano()/1000)
 		response.WriteError("ERR Internal")
 		module.responses[clientId%int64(len(module.responses))].dispatch(response.serialize())
 	}
@@ -51,11 +51,12 @@ func (module *redisModule) commandCleanup(clientId, requestId int64, cmd []byte,
 	}
 }
 
-func (module *redisModule) onRequest(clientId, requestId int64, request [][]byte) {
+func (module *redisModule) onRequest(clientId, requestId, timestamp int64, request [][]byte) {
 	startTime := time.Now()
-	response := newResponse(clientId, requestId)
+	response := newResponse(clientId, requestId, timestamp, startTime.UnixNano()/1000)
 	go func() {
-		defer module.commandCleanup(clientId, requestId, request[0], startTime)
+		response.updateProcessTime()
+		defer module.commandCleanup(clientId, requestId, request[0], timestamp, startTime)
 		ctx := context.WithValue(context.Background(), sessionIdKey, clientId)
 		module.worker.OnCommand(ctx, module.NewRedisClient(), request, response)
 		module.responses[clientId%int64(len(module.responses))].dispatch(response.serialize())

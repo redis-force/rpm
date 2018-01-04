@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #ifndef __LP64__
 error "Only LP64 architectures are supported"
@@ -87,6 +88,7 @@ struct rpm_context {
   int32_t restart_count;
   int32_t retry_timeout;
   int32_t retry_attempts;
+  int32_t debug_mode;
   time_t restart_count_reset_time;
   char *shutdown_command;
   long long restart_timer;
@@ -103,6 +105,7 @@ struct rpm_context_config_descriptor {
 
 static void rpm_context_int32_config_parser(void *, RedisModuleString **);
 static void rpm_context_string_config_parser(void *, RedisModuleString **);
+static void rpm_context_bool_config_parser(void *, RedisModuleString **);
 
 static const rpm_context_config_descriptor rpm_config_descriptors[] = {
   {"--num-downstreams", 1, offsetof(rpm_context, num_downstreams), rpm_context_int32_config_parser},
@@ -110,8 +113,34 @@ static const rpm_context_config_descriptor rpm_config_descriptors[] = {
   {"--retry-timeout", 1, offsetof(rpm_context, retry_timeout), rpm_context_int32_config_parser},
   {"--retry-attempts", 1, offsetof(rpm_context, retry_attempts), rpm_context_int32_config_parser},
   {"--shutdown-command", 1, offsetof(rpm_context, shutdown_command), rpm_context_string_config_parser},
+  {"--debug", 0, offsetof(rpm_context, debug_mode), rpm_context_bool_config_parser},
   {NULL, 0, 0, NULL},
 };
+
+struct rpm_command_profile_data {
+  uint64_t command_start_time;
+  uint32_t worker_start_offset;
+  uint32_t worker_process_offset;
+  uint32_t worker_serialize_offset;
+  uint32_t worker_send_offset;
+  uint32_t serialized_size;
+  uint32_t padding;
+};
+
+static inline unsigned long long rpm_current_us(void);
+static void rpm_log_profile_data(RedisModuleCtx *ctx, redis_response *client_id,
+    redis_response *request_id, redis_response *profile, const char *state) {
+  struct rpm_command_profile_data *real_profile = (struct rpm_command_profile_data *) profile->payload.string.str;
+  if (profile->payload.string.length < sizeof(struct rpm_command_profile_data)) {
+    RedisModule_Log(ctx, "warning", "invalid profile data for client %lld command %lld");
+  } else {
+    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s with %u bytes payload: 0/%u/%u/%u/%u/%llu",
+        client_id->payload.integer, request_id->payload.integer, (long long) real_profile->command_start_time, state,
+        real_profile->serialized_size, real_profile->worker_start_offset, real_profile->worker_process_offset,
+        real_profile->worker_serialize_offset, real_profile->worker_send_offset,
+        rpm_current_us() - (unsigned long long) real_profile->command_start_time);
+  }
+}
 
 static uint32_t int_key_hash_algorithm(hash_map *map, const void *data, size_t size) {
   REDISMODULE_NOT_USED(map);
@@ -258,13 +287,17 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm);
 
 static int rpm_worker_command_on_reply(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
   void *data = RedisModule_GetBlockedClientPrivateData(ctx);
+  rpm_context *rpm = rpm_context_get(ctx);
+  redis_response *reply = data;
   REDISMODULE_NOT_USED(argv);
   REDISMODULE_NOT_USED(argc);
   if (data == RPM_BAD_GATEWAY) {
     RedisModule_ReplyWithError(ctx, RPM_BAD_GATEWAY);
   } else {
-    redis_response *reply = data;
-    rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[2]);
+    rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[3]);
+    if (rpm->debug_mode) {
+      rpm_log_profile_data(ctx, reply->payload.array.array[0], reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
+    }
   }
   return 0;
 }
@@ -313,13 +346,19 @@ static void *rpm_worker_process_reply(rpm_context *rpm, int64_t client_id, int64
   }
 }
 
+static inline unsigned long long rpm_current_us(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (tv.tv_sec * 1000000ll) + tv.tv_usec;
+}
+
 static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
   int idx;
   size_t len;
-  char *tmp, client_id_buffer[32], request_id_buffer[32];
+  char *tmp, client_id_buffer[32], request_id_buffer[32], timestamp_buffer[32];
   chained_buffer *cmd;
-  const char **args;
-  size_t *num_args;
+  const char **args, *second, *omit;
+  size_t *args_len;
   rpm_context *rpm;
   long long timeout, client_id;
   worker_pipe *upstream;
@@ -331,21 +370,33 @@ static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleStr
     RedisModule_ReplyWithError(ctx, RPM_BAD_GATEWAY);
     return REDISMODULE_OK;
   }
-  args = RedisModule_Alloc((sizeof(char *) + sizeof(size_t)) * (argc + 2));
-  num_args = (size_t *) (args + argc + 2);
+  args = RedisModule_Alloc((sizeof(char *) + sizeof(size_t)) * (argc + 3));
+  args_len = (size_t *) (args + argc + 3);
   upstream = rpm->worker->upstreams + (client_id % rpm->worker->num_upstreams);
   if (rpm->command_timeout) {
     tmp = (char *) RedisModule_StringPtrLen(argv[0], &len);
     hash_map_find(rpm->command_timeout, tmp, len, (const void **) &timeout, &len);
   }
   args[0] = client_id_buffer;
-  num_args[0] = snprintf(client_id_buffer, sizeof(client_id_buffer), "%lld", client_id);
+  args_len[0] = snprintf(client_id_buffer, sizeof(client_id_buffer), "%lld", client_id);
   args[1] = request_id_buffer;
-  num_args[1] = snprintf(request_id_buffer, sizeof(request_id_buffer), "%lld", rpm_worker_process_request(ctx, rpm, timeout, client_id));
+  args_len[1] = snprintf(request_id_buffer, sizeof(request_id_buffer), "%lld", rpm_worker_process_request(ctx, rpm, timeout, client_id));
+  args[2] = timestamp_buffer;
+  args_len[2] = snprintf(timestamp_buffer, sizeof(timestamp_buffer), "%llu", rpm_current_us());
   for (idx = 0; idx < argc; ++idx) {
-    args[idx + 2] = RedisModule_StringPtrLen(argv[idx], num_args + idx + 2);
+    args[idx + 3] = RedisModule_StringPtrLen(argv[idx], args_len + idx + 3);
   }
-  cmd = redis_format_command(rpm->allocator, argc + 2, args, num_args);
+  if (rpm->debug_mode) {
+    if (argc > 1) {
+      second = args[4];
+      omit = argc > 2 ? "[...]" : "";
+    } else {
+      second = "";
+      omit = "";
+    }
+    RedisModule_Log(ctx, "notice", "client %s execute command %s: %s %s %s", client_id_buffer, request_id_buffer, args[3], second, omit);
+  }
+  cmd = redis_format_command(rpm->allocator, argc + 3, args, args_len);
   rpm_worker_upstream_write(ctx, upstream, upstream->pipe[0], cmd);
   RedisModule_Free(args);
   return REDISMODULE_OK;
@@ -394,14 +445,18 @@ static void rpm_worker_log_flush(RedisModuleCtx *ctx, worker_pipe *pipe, const c
 static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *reply) {
   redis_response *client_id, *request_id;
   rpm_context *rpm = rpm_context_get(ctx);
-  if (reply->type != REDIS_RESPONSE_ARRAY || reply->payload.array.length != 3 || 
+  if (reply->type != REDIS_RESPONSE_ARRAY || reply->payload.array.length != 4 ||
       reply->payload.array.array[0]->type != REDIS_RESPONSE_INTEGER ||
-      reply->payload.array.array[1]->type != REDIS_RESPONSE_INTEGER) {
+      reply->payload.array.array[1]->type != REDIS_RESPONSE_INTEGER ||
+      reply->payload.array.array[2]->type != REDIS_RESPONSE_STRING) {
     return REDIS_RESPONSE_ERROR_PROTOCOL;
   }
   client_id = reply->payload.array.array[0];
   request_id = reply->payload.array.array[1];
   if ((reply = rpm_worker_process_reply(rpm, client_id->payload.integer, request_id->payload.integer, reply)) != NULL) {
+    if (rpm->debug_mode) {
+      rpm_log_profile_data(ctx, client_id, request_id, reply->payload.array.array[2], "timeout");
+    }
     redis_response_reader_free_response(reply);
   }
   return REDIS_RESPONSE_OK;
@@ -784,6 +839,11 @@ static void rpm_context_string_config_parser(void *field, RedisModuleString **ar
   memcpy(copy, arg, len);
   copy[len] = '\0';
   *((char **) field) = copy;
+}
+
+static void rpm_context_bool_config_parser(void *field, RedisModuleString **argv) {
+  REDISMODULE_NOT_USED(argv);
+  *((int32_t *) field) = 1;
 }
 
 static rpm_context *rpm_context_create(RedisModuleCtx *ctx, int argc, RedisModuleString **argv)

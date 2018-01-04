@@ -3,11 +3,28 @@ package rpm
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"reflect"
 	"strconv"
+	"time"
+	"unsafe"
 )
+
+var nativeEndian binary.ByteOrder
+
+const INT_SIZE int = int(unsafe.Sizeof(0))
+
+func init() {
+	var i int = 0x1
+	bs := (*[INT_SIZE]byte)(unsafe.Pointer(&i))
+	if bs[0] == 0 {
+		nativeEndian = binary.BigEndian
+	} else {
+		nativeEndian = binary.LittleEndian
+	}
+}
 
 type protocolError string
 
@@ -165,10 +182,13 @@ func consumeAllQuota(stack []int) []int {
 }
 
 type moduleResponse struct {
-	response   *bytes.Buffer
-	lenBuffer  [32]byte
-	numBuffer  [40]byte
-	quotaStack []int
+	response                *bytes.Buffer
+	lenBuffer               [32]byte
+	numBuffer               [40]byte
+	quotaStack              []int
+	profileTimestamps       [5]int64
+	profileTimestampsOffset int
+	serialized              []byte
 }
 
 func writeInt64ToBuffer(prefix byte, n int64, buffer []byte) int {
@@ -188,19 +208,38 @@ func writeInt64ToBuffer(prefix byte, n int64, buffer []byte) int {
 	return len(buffer) - idx
 }
 
-func newResponse(clientId, requestId int64) *moduleResponse {
-	var header [80]byte
-	idx := len(header) - writeInt64ToBuffer(':', requestId, header[:])
+func newResponse(clientId, requestId, commandTimestamp, workerStartTimestamp int64) *moduleResponse {
+	var header [130]byte
+	idx := len(header)
+	header[idx-1] = '\n'
+	header[idx-2] = '\r'
+	header[idx-35] = '\n'
+	header[idx-36] = '\r'
+	header[idx-37] = '2'
+	header[idx-38] = '3'
+	header[idx-39] = '$'
+	idx -= 39
+	idx -= writeInt64ToBuffer(':', requestId, header[:idx])
 	idx -= writeInt64ToBuffer(':', clientId, header[:idx])
 	header[idx-1] = '\n'
 	header[idx-2] = '\r'
-	header[idx-3] = '3'
+	header[idx-3] = '4'
 	header[idx-4] = '*'
 	slice := header[idx-4:]
 	return &moduleResponse{
-		response:   bytes.NewBuffer(slice),
-		quotaStack: newQuotaStack(),
+		response:                bytes.NewBuffer(slice),
+		quotaStack:              newQuotaStack(),
+		profileTimestamps:       [5]int64{commandTimestamp, workerStartTimestamp, 0, 0, 0},
+		profileTimestampsOffset: len(slice) - 34,
 	}
+}
+
+func (response *moduleResponse) updateProfileTimeAt(index int) {
+	response.profileTimestamps[index] = time.Now().UnixNano() / 1000
+}
+
+func (response *moduleResponse) updateProcessTime() {
+	response.updateProfileTimeAt(2)
 }
 
 func (response *moduleResponse) newQuota(quota int) {
@@ -215,13 +254,33 @@ func (response *moduleResponse) consumeAllQuota() {
 	response.quotaStack = consumeAllQuota(response.quotaStack)
 }
 
-func (response *moduleResponse) serialize() []byte {
+func (response *moduleResponse) serialize() *moduleResponse {
 	for _, quota := range response.quotaStack {
 		if quota != 0 {
 			panic(fmt.Sprintf("Invalid Response: %v\n", response.quotaStack))
 		}
 	}
-	return response.response.Bytes()
+	response.updateProfileTimeAt(3)
+	response.serialized = response.response.Bytes()
+	return response
+}
+
+func (response *moduleResponse) write(upstream io.Writer) {
+	profileData := response.serialized[response.profileTimestampsOffset : response.profileTimestampsOffset+32]
+	response.updateProfileTimeAt(4)
+	for i, ts := range response.profileTimestamps {
+		if i == 0 {
+			nativeEndian.PutUint64(profileData, uint64(ts))
+		} else {
+			var offset = ts - response.profileTimestamps[0]
+			if offset < 0 {
+				offset = 0
+			}
+			nativeEndian.PutUint32(profileData[4*(i+1):], uint32(offset))
+		}
+	}
+	nativeEndian.PutUint32(profileData[24:], uint32(len(response.serialized)))
+	upstream.Write(response.serialized)
 }
 
 func (response *moduleResponse) writeLen(prefix byte, n int) error {

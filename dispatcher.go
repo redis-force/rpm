@@ -162,14 +162,14 @@ func newDownstreamDispatchers(downstreams []net.Conn) []dispatcher {
 
 type responseDispatcher struct {
 	dispatcherLifecycle
-	responses chan []byte
+	responses chan *moduleResponse
 	upstream  net.Conn
 }
 
 func (dispatcher *responseDispatcher) run() {
 	upstream := dispatcher.upstream
 	for response := range dispatcher.responses {
-		upstream.Write(response)
+		response.write(upstream)
 	}
 }
 
@@ -189,12 +189,12 @@ func (dispatcher *responseDispatcher) shutdown() {
 }
 
 func (dispatcher *responseDispatcher) dispatch(item interface{}) {
-	dispatcher.responses <- item.([]byte)
+	dispatcher.responses <- item.(*moduleResponse)
 }
 
 func newResponseDispatcher(upstream net.Conn) dispatcher {
 	return &responseDispatcher{
-		responses: make(chan []byte),
+		responses: make(chan *moduleResponse),
 		upstream:  upstream,
 	}
 }
@@ -216,12 +216,14 @@ type requestDispatcher struct {
 func (dispatcher *requestDispatcher) run(module *redisModule) {
 	var command [][]byte
 	var err error
-	var clientId, requestId int64
+	var clientId, requestId, timestamp int64
 	for {
 		if command, err = newRequest(dispatcher.input); err == nil {
 			if clientId, err = strconv.ParseInt(string(command[0]), 10, 64); err == nil {
 				if requestId, err = strconv.ParseInt(string(command[1]), 10, 64); err == nil {
-					module.onRequest(clientId, requestId, command[2:])
+					if timestamp, err = strconv.ParseInt(string(command[2]), 10, 64); err == nil {
+						module.onRequest(clientId, requestId, timestamp, command[3:])
+					}
 				}
 				continue
 			}
