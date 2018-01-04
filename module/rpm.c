@@ -128,15 +128,15 @@ struct rpm_command_profile_data {
 };
 
 static inline unsigned long long rpm_current_us(void);
-static void rpm_log_profile_data(RedisModuleCtx *ctx, uint64_t receive_time, redis_response *client_id,
-    redis_response *request_id, redis_response *profile, const char *state) {
+static void rpm_log_profile_data(RedisModuleCtx *ctx, uint64_t receive_time, worker_pipe *upstream,
+    redis_response *client_id, redis_response *request_id, redis_response *profile, const char *state) {
   struct rpm_command_profile_data *real_profile = (struct rpm_command_profile_data *) profile->payload.string.str;
   if (profile->payload.string.length < sizeof(struct rpm_command_profile_data)) {
     RedisModule_Log(ctx, "warning", "invalid profile data for client %lld command %lld");
   } else {
-    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s with %u bytes payload: 0/%u/%u/%u/%u/%llu/%llu",
+    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s with %u bytes payload from upstream %p: 0/%u/%u/%u/%u/%llu/%llu",
         client_id->payload.integer, request_id->payload.integer, (long long) real_profile->command_start_time, state,
-        real_profile->serialized_size, real_profile->worker_start_offset, real_profile->worker_process_offset,
+        real_profile->serialized_size, upstream, real_profile->worker_start_offset, real_profile->worker_process_offset,
         real_profile->worker_serialize_offset, real_profile->worker_send_offset,
         (unsigned long long) (receive_time - real_profile->command_start_time),
         (unsigned long long) (rpm_current_us() - real_profile->command_start_time));
@@ -297,7 +297,7 @@ static int rpm_worker_command_on_reply(RedisModuleCtx *ctx, RedisModuleString **
   } else {
     rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[3]);
     if (rpm->debug_mode) {
-      rpm_log_profile_data(ctx, reply->receive_time, reply->payload.array.array[0], reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
+      rpm_log_profile_data(ctx, reply->receive_time, reply->upstream, reply->payload.array.array[0], reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
     }
   }
   return 0;
@@ -358,7 +358,7 @@ static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleStr
   size_t len;
   char *tmp, client_id_buffer[32], request_id_buffer[32], timestamp_buffer[32];
   chained_buffer *cmd;
-  const char **args, *second, *omit;
+  const char **args, *second, *third, *omit;
   size_t *args_len;
   rpm_context *rpm;
   long long timeout, client_id;
@@ -390,12 +390,14 @@ static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleStr
   if (rpm->debug_mode) {
     if (argc > 1) {
       second = args[4];
-      omit = argc > 2 ? "[...]" : "";
+      third = argc > 2 ? args[5] : "";
+      omit = argc > 3 ? "[...]" : "";
     } else {
       second = "";
+      third = "";
       omit = "";
     }
-    RedisModule_Log(ctx, "notice", "client %s execute command %s: %s %s %s", client_id_buffer, request_id_buffer, args[3], second, omit);
+    RedisModule_Log(ctx, "notice", "client %s execute command %s on stream %p: %s %s %s %s", client_id_buffer, request_id_buffer, upstream, args[3], second, third, omit);
   }
   cmd = redis_format_command(rpm->allocator, argc + 3, args, args_len);
   rpm_worker_upstream_write(ctx, upstream, upstream->pipe[0], cmd);
@@ -443,7 +445,7 @@ static void rpm_worker_log_flush(RedisModuleCtx *ctx, worker_pipe *pipe, const c
   RedisModule_Log(ctx, level, "%s", log_buffer);
 }
 
-static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *reply) {
+static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *reply, worker_pipe *upstream) {
   redis_response *client_id, *request_id;
   rpm_context *rpm = rpm_context_get(ctx);
   if (reply->type != REDIS_RESPONSE_ARRAY || reply->payload.array.length != 4 ||
@@ -455,9 +457,10 @@ static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *rep
   client_id = reply->payload.array.array[0];
   request_id = reply->payload.array.array[1];
   reply->receive_time = rpm_current_us();
+  reply->upstream = upstream;
   if ((reply = rpm_worker_process_reply(rpm, client_id->payload.integer, request_id->payload.integer, reply)) != NULL) {
     if (rpm->debug_mode) {
-      rpm_log_profile_data(ctx, reply->receive_time, client_id, request_id, reply->payload.array.array[2], "timeout");
+      rpm_log_profile_data(ctx, reply->receive_time, upstream, client_id, request_id, reply->payload.array.array[2], "timeout");
     }
     redis_response_reader_free_response(reply);
   }
@@ -477,7 +480,7 @@ static void rpm_worker_upstream_read(RedisModuleCtx *ctx, int fd, void *client_d
   while ((rd = read(fd, buf, sizeof(worker->buf))) > 0) {
     redis_response_reader_feed(reader, buf, rd);
     while (st == REDIS_RESPONSE_OK && (st = redis_response_reader_next(reader, &reply)) == REDIS_RESPONSE_OK && reply != NULL) {
-      st = rpm_worker_upstream_on_reply(ctx, reply);
+      st = rpm_worker_upstream_on_reply(ctx, reply, pipe);
     }
     if (st != REDIS_RESPONSE_OK) {
       /* protocol error, kill worker and restart to fix the channel */
