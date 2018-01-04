@@ -128,20 +128,6 @@ struct rpm_command_profile_data {
 };
 
 static inline unsigned long long rpm_current_us(void);
-static void rpm_log_profile_data(RedisModuleCtx *ctx, uint64_t receive_time, worker_pipe *upstream,
-    redis_response *client_id, redis_response *request_id, redis_response *profile, const char *state) {
-  struct rpm_command_profile_data *real_profile = (struct rpm_command_profile_data *) profile->payload.string.str;
-  if (profile->payload.string.length < sizeof(struct rpm_command_profile_data)) {
-    RedisModule_Log(ctx, "warning", "invalid profile data for client %lld command %lld");
-  } else {
-    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s with %u bytes payload from upstream %p: 0/%u/%u/%u/%u/%llu/%llu",
-        client_id->payload.integer, request_id->payload.integer, (long long) real_profile->command_start_time, state,
-        real_profile->serialized_size, upstream, real_profile->worker_start_offset, real_profile->worker_process_offset,
-        real_profile->worker_serialize_offset, real_profile->worker_send_offset,
-        (unsigned long long) (receive_time - real_profile->command_start_time),
-        (unsigned long long) (rpm_current_us() - real_profile->command_start_time));
-  }
-}
 
 static uint32_t int_key_hash_algorithm(hash_map *map, const void *data, size_t size) {
   REDISMODULE_NOT_USED(map);
@@ -181,6 +167,23 @@ struct worker_process {
   hash_map *client_id_to_request_id;
   char buf[1024*1024];
 };
+
+static void rpm_log_profile_data(RedisModuleCtx *ctx, uint64_t receive_time, worker_pipe *upstream,
+    redis_response *client_id, redis_response *request_id, redis_response *profile, const char *state) {
+  struct rpm_command_profile_data *real_profile = (struct rpm_command_profile_data *) profile->payload.string.str;
+  if (profile->payload.string.length < sizeof(struct rpm_command_profile_data)) {
+    RedisModule_Log(ctx, "warning", "invalid profile data for client %lld command %lld");
+  } else {
+    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s "
+        "with %u bytes payload from upstream %d:%d@%p: 0/%u/%u/%u/%u/%llu/%llu",
+        client_id->payload.integer, request_id->payload.integer, (long long) real_profile->command_start_time, state,
+        real_profile->serialized_size, upstream->pipe[0], upstream->pipe[1], upstream, 
+        real_profile->worker_start_offset, real_profile->worker_process_offset,
+        real_profile->worker_serialize_offset, real_profile->worker_send_offset,
+        (unsigned long long) (receive_time - real_profile->command_start_time),
+        (unsigned long long) (rpm_current_us() - real_profile->command_start_time));
+  }
+}
 
 static inline rpm_context *rpm_context_get(RedisModuleCtx *ctx) {
   return RedisModule_GetAttachment(ctx, NULL, 0);
@@ -297,7 +300,8 @@ static int rpm_worker_command_on_reply(RedisModuleCtx *ctx, RedisModuleString **
   } else {
     rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[3]);
     if (rpm->debug_mode) {
-      rpm_log_profile_data(ctx, reply->receive_time, reply->upstream, reply->payload.array.array[0], reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
+      rpm_log_profile_data(ctx, reply->receive_time, reply->upstream, reply->payload.array.array[0], 
+          reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
     }
   }
   return 0;
@@ -397,7 +401,8 @@ static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleStr
       third = "";
       omit = "";
     }
-    RedisModule_Log(ctx, "notice", "client %s execute command %s on stream %p: %s %s %s %s", client_id_buffer, request_id_buffer, upstream, args[3], second, third, omit);
+    RedisModule_Log(ctx, "warning", "client %s execute command %s on stream %d:%d@%p: %s %s %s %s", client_id_buffer, 
+        request_id_buffer, upstream->pipe[0], upstream->pipe[1], upstream, args[3], second, third, omit);
   }
   cmd = redis_format_command(rpm->allocator, argc + 3, args, args_len);
   rpm_worker_upstream_write(ctx, upstream, upstream->pipe[0], cmd);
