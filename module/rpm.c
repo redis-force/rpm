@@ -14,6 +14,7 @@
 #include "rpm_hashmap.h"
 #include "rpm_chained_buffer.h"
 #include "rpm_redis.h"
+#include "rpm_queue.h"
 #include <sys/types.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -31,7 +32,7 @@ error "Only LP64 architectures are supported"
 #define RPM_DEFAULT_DOWNSTREAM (4)
 #define RPM_MAX_DOWNSTREAM (16)
 
-#define RPM_DEFAULT_UPSTREAM (4)
+#define RPM_DEFAULT_UPSTREAM (1)
 #define RPM_MAX_UPSTREAM (16)
 
 #define ENV_RPM_DOWNSTREAM_FD_PREFIX "RPM_DOWNSTREAM_FD"
@@ -39,18 +40,26 @@ error "Only LP64 architectures are supported"
 #define ENV_RPM_UPSTREAM_FD_PREFIX "RPM_UPSTREAM_FD"
 #define ENV_RPM_UPSTREAM_FD_NUM "RPM_UPSTREAM_FD_NUM"
 
+#define WORKER_SHUTDOWN_EVENT_TYPE_SUICIDE 'S'
+#define WORKER_SHUTDOWN_EVENT_TYPE_TERMINATE 'T'
+
+#define PROFILE_ELAPSED_THRESHOLD (10000)
+
 const char *RPM_BAD_GATEWAY = "ERR Bad Gateway";
 const char *RPM_REQUEST_TIMEOUT = "ERR Request Timeout";
 const int64_t RPM_DEFAULT_TIMEOUT = 1000;
+void *WORKER_PIPE_SHUTDOWN = "SHUTDOWN";
 
 typedef struct rpm_context rpm_context;
 typedef struct worker_process worker_process;
 typedef struct worker_pipe worker_pipe;
+typedef struct worker_upstream worker_upstream;
 typedef struct rpm_context_config_descriptor rpm_context_config_descriptor;
 
 static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_process *worker);
+static void rpm_worker_free(worker_process *worker);
+static void rpm_worker_release(worker_process *worker);
 static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm);
-static void rpm_worker_suicide(RedisModuleCtx *ctx, worker_process *worker);
 static void rpm_context_shutdown_redis(RedisModuleCtx *ctx, rpm_context *rpm);
 
 static void *rpm_allocator_malloc(void *privdata, size_t size) {
@@ -144,6 +153,15 @@ static hash_map_type command_timeout_map = {
   NULL, hash_map_allocator_dup_data, NULL, hash_map_bitwise_compare_data, hash_map_allocator_destroy_data, NULL, NULL,
 };
 
+struct worker_upstream {
+  worker_process *worker;
+  int pipe[2];
+  queue *command_queue;
+  pthread_t writer;
+  pthread_t reader;
+  char buf[16*1024];
+};
+
 struct worker_pipe {
   worker_process *worker;
   chained_buffer *read_buffer;
@@ -151,37 +169,48 @@ struct worker_pipe {
   chained_buffer **next_buffer;
   int32_t num_buffers;
   int pipe[2];
-  void *user_data;
 };
 
 struct worker_process {
+  rpm_context *rpm;
   worker_pipe out;
   worker_pipe err;
-  redis_response_reader **readers;
   int32_t num_downstreams;
   int *downstreams;
   int32_t num_upstreams;
-  int32_t active_upstreams;
-  worker_pipe *upstreams;
+  worker_upstream *upstreams;
   hash_map *request_id_to_client;
   hash_map *client_id_to_request_id;
-  char buf[1024*1024];
+  pthread_mutex_t request_id_to_client_mutex;
+  pthread_mutex_t client_id_to_request_id_mutex;
+  pthread_mutex_t refcount_mutex;
+  int32_t active_upstreams;
+  char log_buf[1024];
+  int shutdown_pipe[2];
+  int32_t refcount;
 };
 
 static void rpm_log_profile_data(RedisModuleCtx *ctx, uint64_t receive_time, worker_pipe *upstream,
     redis_response *client_id, redis_response *request_id, redis_response *profile, const char *state) {
   struct rpm_command_profile_data *real_profile = (struct rpm_command_profile_data *) profile->payload.string.str;
+  unsigned long long receive_offset, reply_offset;
   if (profile->payload.string.length < sizeof(struct rpm_command_profile_data)) {
     RedisModule_Log(ctx, "warning", "invalid profile data for client %lld command %lld");
   } else {
-    RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s "
-        "with %u bytes payload from upstream %d:%d@%p: 0/%u/%u/%u/%u/%llu/%llu",
-        client_id->payload.integer, request_id->payload.integer, (long long) real_profile->command_start_time, state,
-        real_profile->serialized_size, upstream->pipe[0], upstream->pipe[1], upstream, 
-        real_profile->worker_start_offset, real_profile->worker_process_offset,
-        real_profile->worker_serialize_offset, real_profile->worker_send_offset,
-        (unsigned long long) (receive_time - real_profile->command_start_time),
-        (unsigned long long) (rpm_current_us() - real_profile->command_start_time));
+    receive_offset = receive_time - real_profile->command_start_time;
+    reply_offset = rpm_current_us() - receive_time;
+    if (real_profile->worker_start_offset > PROFILE_ELAPSED_THRESHOLD ||
+        receive_offset - real_profile->worker_send_offset > PROFILE_ELAPSED_THRESHOLD ||
+        reply_offset > PROFILE_ELAPSED_THRESHOLD) {
+      RedisModule_Log(ctx, "warning", "execute client %lld command %lld received at %lld %s "
+          "with %u bytes payload from upstream %d@%p: 0/%u/%u/%u/%u/%llu/%llu",
+          client_id->payload.integer, request_id->payload.integer, (long long) real_profile->command_start_time, state,
+          real_profile->serialized_size, upstream->pipe[0], upstream,
+          real_profile->worker_start_offset, real_profile->worker_process_offset,
+          real_profile->worker_serialize_offset, real_profile->worker_send_offset,
+          (unsigned long long) (receive_time - real_profile->command_start_time),
+          (unsigned long long) (rpm_current_us() - real_profile->command_start_time));
+    }
   }
 }
 
@@ -195,11 +224,6 @@ static void rpm_worker_pipe_buffer_reset(worker_pipe *pipe) {
   pipe->num_buffers = 0;
 }
 
-static void rpm_worker_pipe_buffer_chained_buffer(worker_pipe *pipe, chained_buffer *buf)
-{
-  chained_buffer_chain(&pipe->read_buffer, &pipe->write_buffer, &pipe->next_buffer, &pipe->num_buffers, buf);
-}
-
 static void rpm_worker_pipe_buffer_data(worker_pipe *pipe, char *buf, int size)
 {
   chained_buffer *buffer = chained_buffer_check(&pipe->read_buffer, &pipe->write_buffer, &pipe->next_buffer, &pipe->num_buffers, size, MAX_REAL_LOG_LEN);
@@ -207,54 +231,154 @@ static void rpm_worker_pipe_buffer_data(worker_pipe *pipe, char *buf, int size)
   buffer->size += size;
 }
 
-static void rpm_worker_upstream_buffer_write(RedisModuleCtx *ctx, int fd, void *client_data, int mask) {
-  worker_pipe *pipe = client_data;
-  chained_buffer *current = pipe->read_buffer;
-  int wr = 0, count = 0, available;
+static void rpm_worker_upstream_submit(RedisModuleCtx *ctx, worker_upstream *upstream, chained_buffer *buf) {
   REDISMODULE_NOT_USED(ctx);
-  REDISMODULE_NOT_USED(mask);
-  while (current != NULL) {
-    available = current->size - current->offset;
-    if ((wr = write(fd, current->buffer + current->offset, available)) < available) {
-      /* there are data leftover inside current buffer */
-      if (wr > 0) {
-        current->offset += wr;
+  queue_push(upstream->command_queue, buf);
+}
+
+static int32_t rpm_worker_upstream_write(int to, chained_buffer *buf) {
+  int32_t wr, available, st = REDISMODULE_OK;
+  while ((available = buf->size - buf->offset) > 0) {
+    wr = write(to, buf->buffer + buf->offset, available);
+    if (wr < 0) {
+      if (errno != EINTR) {
+        st = REDISMODULE_ERR;
+        goto cleanup_exit;
       }
-      break;
-    }
-    ++count;
-    current = current->next;
-  }
-
-  chained_buffer_destroy(&pipe->read_buffer, count);
-  pipe->num_buffers -= count;
-  if (pipe->read_buffer == NULL) {
-    rpm_worker_pipe_buffer_reset(pipe);
-    RedisModule_DeleteFileEvent(ctx, fd, REDISMODULE_WRITE);
-  }
-}
-
-static void rpm_worker_upstream_buffer_data(RedisModuleCtx *ctx, worker_pipe *pipe, int to, chained_buffer *buf) {
-  if (pipe->write_buffer == NULL) {
-    RedisModule_CreateFileEvent(ctx, to, REDISMODULE_WRITE, rpm_worker_upstream_buffer_write, pipe);
-  }
-  rpm_worker_pipe_buffer_chained_buffer(pipe, buf);
-}
-
-static void rpm_worker_upstream_write(RedisModuleCtx *ctx, worker_pipe *pipe, int to, chained_buffer *buf) {
-  int32_t wr, available;
-  if (pipe->write_buffer == NULL) {
-    available = buf->size - buf->offset;
-    if ((wr = write(to, buf->buffer + buf->offset, available)) == available) {
-      chained_buffer_destroy(&buf, 1);
-      return;
-    }
-    if (wr > 0) {
+    } else {
       buf->offset += wr;
     }
   }
-  rpm_worker_upstream_buffer_data(ctx, pipe, to, buf);
-  return;
+cleanup_exit:
+  chained_buffer_destroy(&buf, 1);
+  return st;
+}
+
+static void rpm_worker_shutdown(worker_process *worker, char type) {
+  if (write(worker->shutdown_pipe[1], &type, 1) != 1) {
+    /* ignored */
+  }
+  pthread_mutex_lock(&worker->refcount_mutex);
+  if (worker->shutdown_pipe[1] != 0) {
+    close(worker->shutdown_pipe[1]);
+    worker->shutdown_pipe[1] = 0;
+  }
+  pthread_mutex_unlock(&worker->refcount_mutex);
+}
+
+static void rpm_worker_upstream_shutdown(worker_upstream *upstream) {
+  worker_process *worker = upstream->worker;
+  int32_t shutdown = 0;
+  pthread_mutex_lock(&worker->refcount_mutex);
+  if (--worker->active_upstreams <= 0) {
+    shutdown = 1;
+  }
+  pthread_mutex_unlock(&worker->refcount_mutex);
+  if (shutdown) {
+    rpm_worker_shutdown(worker, WORKER_SHUTDOWN_EVENT_TYPE_TERMINATE);
+  }
+}
+
+static void *rpm_worker_reply(worker_process *worker, int64_t client_id, int64_t request_id, void *reply) {
+  RedisModuleBlockedClient *bc = NULL;
+  void *result;
+  size_t ignored;
+  int32_t find;
+  pthread_mutex_lock(&worker->request_id_to_client_mutex);
+  find = hash_map_find(worker->request_id_to_client, hash_map_int_ptr(request_id), sizeof(request_id), (const void **) &bc, &ignored);
+  if (find != 0) {
+    result = reply;
+    pthread_mutex_unlock(&worker->request_id_to_client_mutex);
+  } else {
+    hash_map_remove(worker->request_id_to_client, hash_map_int_ptr(request_id), sizeof(request_id));
+    pthread_mutex_unlock(&worker->request_id_to_client_mutex);
+    pthread_mutex_lock(&worker->client_id_to_request_id_mutex);
+    hash_map_remove(worker->client_id_to_request_id, hash_map_int_ptr(client_id), sizeof(client_id));
+    pthread_mutex_unlock(&worker->client_id_to_request_id_mutex);
+    result = NULL;
+  }
+  if (result == NULL) {
+    RedisModule_UnblockClient(bc, reply);
+  }
+  return result;
+}
+
+static int32_t rpm_worker_upstream_reply(worker_upstream *upstream, redis_response *reply) {
+  redis_response *client_id, *request_id;
+  if (reply->type != REDIS_RESPONSE_ARRAY || reply->payload.array.length != 4 ||
+      reply->payload.array.array[0]->type != REDIS_RESPONSE_INTEGER ||
+      reply->payload.array.array[1]->type != REDIS_RESPONSE_INTEGER ||
+      reply->payload.array.array[2]->type != REDIS_RESPONSE_STRING) {
+    redis_response_reader_free_response(reply);
+    return REDIS_RESPONSE_ERROR_PROTOCOL;
+  }
+  client_id = reply->payload.array.array[0];
+  request_id = reply->payload.array.array[1];
+  reply->receive_time = rpm_current_us();
+  reply->upstream = upstream;
+  if ((reply = rpm_worker_reply(upstream->worker, client_id->payload.integer, request_id->payload.integer, reply)) != NULL) {
+    redis_response_reader_free_response(reply);
+  }
+  return REDISMODULE_OK;
+}
+
+static void *rpm_worker_upstream_writer_dispatch(void *arg) {
+  worker_upstream *upstream = arg;
+  chained_buffer *command;
+  queue_pop_result result;
+  while (1) {
+    queue_pop(upstream->command_queue, &result);
+    while ((command = queue_pop_result_next(&result)) != NULL) {
+      if (command == WORKER_PIPE_SHUTDOWN) {
+        goto cleanup_exit;
+      } else {
+        if (rpm_worker_upstream_write(upstream->pipe[0], command) != REDISMODULE_OK) {
+          goto cleanup_exit;
+        }
+      }
+    }
+  }
+cleanup_exit:
+  while ((command = queue_pop_result_next(&result)) != NULL) {
+    if (command != WORKER_PIPE_SHUTDOWN) {
+      chained_buffer_destroy(&command, 1);
+    }
+  }
+  rpm_worker_release(upstream->worker);
+  return NULL;
+}
+
+static void *rpm_worker_upstream_reader_dispatch(void *arg) {
+  int rd, fd;
+  worker_upstream *upstream = arg;
+  redis_response_status st = REDIS_RESPONSE_OK;
+  redis_response_reader *reader = redis_response_reader_create(upstream->worker->rpm->allocator, 1024 * 1024);
+  char *buf = upstream->buf;
+  redis_response *reply = NULL;
+  fd = upstream->pipe[0];
+  while (1) {
+    while ((rd = read(fd, buf, sizeof(upstream->buf))) > 0) {
+      redis_response_reader_feed(reader, buf, rd);
+      while (st == REDIS_RESPONSE_OK && (st = redis_response_reader_next(reader, &reply)) == REDIS_RESPONSE_OK && reply != NULL) {
+        st = rpm_worker_upstream_reply(upstream, reply);
+      }
+      if (st != REDIS_RESPONSE_OK) {
+        /* protocol error, kill worker and restart to fix the channel */
+        rpm_worker_shutdown(upstream->worker, WORKER_SHUTDOWN_EVENT_TYPE_SUICIDE);
+        goto cleanup_exit;
+      }
+    }
+    if (rd == 0 || (rd == -1 && errno != EINTR)) {
+      /* upstream eof, worker process must be died, restart it automatically */
+      rpm_worker_upstream_shutdown(upstream);
+      goto cleanup_exit;
+    }
+  }
+
+cleanup_exit:
+  redis_response_reader_free(reader);
+  rpm_worker_release(upstream->worker);
+  return NULL;
 }
 
 static int rpm_worker_command_on_reply_item(RedisModuleCtx *ctx, redis_response *item) {
@@ -310,12 +434,20 @@ static int rpm_worker_command_on_reply(RedisModuleCtx *ctx, RedisModuleString **
 static int rpm_worker_command_on_timeout(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
   size_t tmp;
   rpm_context *rpm = rpm_context_get(ctx);
+  int32_t find;
   long long request_id, client_id = RedisModule_GetClientId(ctx);
   REDISMODULE_NOT_USED(argv);
   REDISMODULE_NOT_USED(argc);
-  if (hash_map_find(rpm->worker->client_id_to_request_id, hash_map_int_ptr(client_id), sizeof(client_id), (const void **) &request_id, &tmp) == 0) {
+  pthread_mutex_lock(&rpm->worker->client_id_to_request_id_mutex);
+  find = hash_map_find(rpm->worker->client_id_to_request_id, hash_map_int_ptr(client_id), sizeof(client_id), (const void **) &request_id, &tmp);
+  if (find == 0) {
     hash_map_remove(rpm->worker->client_id_to_request_id, hash_map_int_ptr(client_id), sizeof(client_id));
+    pthread_mutex_unlock(&rpm->worker->client_id_to_request_id_mutex);
+    pthread_mutex_lock(&rpm->worker->request_id_to_client_mutex);
     hash_map_remove(rpm->worker->request_id_to_client, hash_map_int_ptr(request_id), sizeof(request_id));
+    pthread_mutex_unlock(&rpm->worker->request_id_to_client_mutex);
+  } else {
+    pthread_mutex_unlock(&rpm->worker->client_id_to_request_id_mutex);
   }
   return RedisModule_ReplyWithError(ctx, RPM_REQUEST_TIMEOUT);
 }
@@ -331,24 +463,14 @@ static long long rpm_worker_process_request(RedisModuleCtx *ctx, rpm_context *rp
   worker_process *worker = rpm->worker;
   RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx, rpm_worker_command_on_reply,
       rpm_worker_command_on_timeout, rpm_worker_command_free_reply, timeout);
+  pthread_mutex_lock(&rpm->worker->request_id_to_client_mutex);
   hash_map_set(worker->request_id_to_client, hash_map_int_ptr(request_id), sizeof(request_id), bc, sizeof(bc));
+  pthread_mutex_unlock(&rpm->worker->request_id_to_client_mutex);
+  pthread_mutex_lock(&rpm->worker->client_id_to_request_id_mutex);
   hash_map_set(rpm->worker->client_id_to_request_id, hash_map_int_ptr(client_id),
       sizeof(client_id), hash_map_int_ptr(request_id), sizeof(request_id));
+  pthread_mutex_unlock(&rpm->worker->client_id_to_request_id_mutex);
   return request_id;
-}
-
-static void *rpm_worker_process_reply(rpm_context *rpm, int64_t client_id, int64_t request_id, void *reply) {
-  RedisModuleBlockedClient *bc = NULL;
-  worker_process *worker = rpm->worker;
-  size_t ignored;
-  if (hash_map_find(worker->request_id_to_client, hash_map_int_ptr(request_id), sizeof(request_id), (const void **) &bc, &ignored) != 0) {
-    return reply;
-  } else {
-    hash_map_remove(worker->client_id_to_request_id, hash_map_int_ptr(client_id), sizeof(client_id));
-    hash_map_remove(worker->request_id_to_client, hash_map_int_ptr(request_id), sizeof(request_id));
-    RedisModule_UnblockClient(bc, reply);
-    return NULL;
-  }
 }
 
 static inline unsigned long long rpm_current_us(void) {
@@ -366,7 +488,7 @@ static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleStr
   size_t *args_len;
   rpm_context *rpm;
   long long timeout, client_id;
-  worker_pipe *upstream;
+  worker_upstream *upstream;
 
   rpm = rpm_context_get(ctx);
   timeout = RPM_DEFAULT_TIMEOUT;
@@ -401,11 +523,11 @@ static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleStr
       third = "";
       omit = "";
     }
-    RedisModule_Log(ctx, "warning", "client %s execute command %s on stream %d:%d@%p: %s %s %s %s", client_id_buffer, 
-        request_id_buffer, upstream->pipe[0], upstream->pipe[1], upstream, args[3], second, third, omit);
+    RedisModule_Log(ctx, "warning", "client %s execute command %s on stream %d@%p: %s %s %s %s", client_id_buffer, 
+        request_id_buffer, upstream->pipe[0], upstream, args[3], second, third, omit);
   }
   cmd = redis_format_command(rpm->allocator, argc + 3, args, args_len);
-  rpm_worker_upstream_write(ctx, upstream, upstream->pipe[0], cmd);
+  rpm_worker_upstream_submit(ctx, upstream, cmd);
   RedisModule_Free(args);
   return REDISMODULE_OK;
 }
@@ -450,69 +572,13 @@ static void rpm_worker_log_flush(RedisModuleCtx *ctx, worker_pipe *pipe, const c
   RedisModule_Log(ctx, level, "%s", log_buffer);
 }
 
-static int rpm_worker_upstream_on_reply(RedisModuleCtx *ctx, redis_response *reply, worker_pipe *upstream) {
-  redis_response *client_id, *request_id;
-  rpm_context *rpm = rpm_context_get(ctx);
-  if (reply->type != REDIS_RESPONSE_ARRAY || reply->payload.array.length != 4 ||
-      reply->payload.array.array[0]->type != REDIS_RESPONSE_INTEGER ||
-      reply->payload.array.array[1]->type != REDIS_RESPONSE_INTEGER ||
-      reply->payload.array.array[2]->type != REDIS_RESPONSE_STRING) {
-    return REDIS_RESPONSE_ERROR_PROTOCOL;
-  }
-  client_id = reply->payload.array.array[0];
-  request_id = reply->payload.array.array[1];
-  reply->receive_time = rpm_current_us();
-  reply->upstream = upstream;
-  if ((reply = rpm_worker_process_reply(rpm, client_id->payload.integer, request_id->payload.integer, reply)) != NULL) {
-    if (rpm->debug_mode) {
-      rpm_log_profile_data(ctx, reply->receive_time, upstream, client_id, request_id, reply->payload.array.array[2], "timeout");
-    }
-    redis_response_reader_free_response(reply);
-  }
-  return REDIS_RESPONSE_OK;
-}
-
-static void rpm_worker_upstream_read(RedisModuleCtx *ctx, int fd, void *client_data, int mask) {
-  int rd;
-  rpm_context *rpm;
-  redis_response_status st = REDIS_RESPONSE_OK;
-  worker_pipe *pipe = client_data;
-  worker_process *worker = pipe->worker;
-  redis_response_reader *reader = pipe->user_data;
-  char *buf = worker->buf;
-  redis_response *reply = NULL;
-  REDISMODULE_NOT_USED(mask);
-  while ((rd = read(fd, buf, sizeof(worker->buf))) > 0) {
-    redis_response_reader_feed(reader, buf, rd);
-    while (st == REDIS_RESPONSE_OK && (st = redis_response_reader_next(reader, &reply)) == REDIS_RESPONSE_OK && reply != NULL) {
-      st = rpm_worker_upstream_on_reply(ctx, reply, pipe);
-    }
-    if (st != REDIS_RESPONSE_OK) {
-      /* protocol error, kill worker and restart to fix the channel */
-      RedisModule_Log(ctx, "warning", "worker process respond invalid response and will be restarted to fix the state. %s",
-          redis_response_reader_strerr(reader));
-      rpm_worker_suicide(ctx, worker);
-    }
-  }
-  if (rd == 0) {
-    /* upstream eof, worker process must be died, restart it automatically */
-    RedisModule_DeleteFileEvent(ctx, fd, REDISMODULE_READ);
-    RedisModule_Log(ctx, "warning", "Upstream connection with fd %d was closed", fd);
-    rpm = rpm_context_get(ctx);
-    if (--worker->active_upstreams <= 0) {
-      RedisModule_Log(ctx, "warning", "All upstream connections were closed, restart worker process now");
-      rpm_worker_destroy(ctx, rpm, worker);
-    }
-  }
-}
-
 static void rpm_worker_log_read(RedisModuleCtx *ctx, int fd, void *client_data, int mask, const char *level) {
   int rd;
   worker_pipe *pipe = client_data;
   worker_process *worker = pipe->worker;
-  char *buf = worker->buf, *start, *end, *linefeed = NULL;
+  char *buf = worker->log_buf, *start, *end, *linefeed = NULL;
   REDISMODULE_NOT_USED(mask);
-  while ((rd = read(fd, buf, sizeof(worker->buf))) > 0) {
+  while ((rd = read(fd, buf, sizeof(worker->log_buf))) > 0) {
     linefeed = start = buf;
     end = buf + rd;
 scan_for_lf:
@@ -536,8 +602,7 @@ static void rpm_worker_stderr_read(RedisModuleCtx *ctx, int fd, void *client_dat
   rpm_worker_log_read(ctx, fd, client_data, mask, "warning");
 }
 
-static void rpm_worker_close_pipe(RedisModuleCtx *ctx, worker_pipe *pipe)
-{
+static void rpm_worker_close_pipe(RedisModuleCtx *ctx, worker_pipe *pipe) {
   if (pipe->pipe[0]) {
     RedisModule_DeleteFileEvent(ctx, pipe->pipe[0], REDISMODULE_READ | (pipe->write_buffer != NULL ? REDISMODULE_WRITE : 0));
     if (pipe->read_buffer != NULL) {
@@ -554,15 +619,17 @@ static void rpm_worker_close_pipe(RedisModuleCtx *ctx, worker_pipe *pipe)
   }
 }
 
-static void rpm_worker_suicide(RedisModuleCtx *ctx, worker_process *worker) {
-  int32_t idx;
-  for (idx = 0; idx < worker->num_upstreams; ++idx) {
-    rpm_worker_close_pipe(ctx, worker->upstreams + idx);
-  }
-  for (idx = 0; idx < worker->num_downstreams; ++idx) {
-    if (worker->downstreams[idx] != 0) {
-      close(worker->downstreams[idx]);
-      worker->downstreams[idx] = 0;
+static void rpm_worker_close_upstream(RedisModuleCtx *ctx, worker_upstream *upstream) {
+  REDISMODULE_NOT_USED(ctx);
+  if (upstream->pipe[0]) {
+    rpm_worker_upstream_submit(ctx, upstream, WORKER_PIPE_SHUTDOWN);
+    if (upstream->pipe[0] != 0) {
+      close(upstream->pipe[0]);
+      upstream->pipe[0] = 0;
+    }
+    if (upstream->pipe[1] != 0) {
+      close(upstream->pipe[1]);
+      upstream->pipe[1] = 0;
     }
   }
 }
@@ -642,15 +709,10 @@ static void rpm_worker_process_start(worker_process *worker, char **argv) {
   exit(1);
 }
 
-static int rpm_worker_pipe_init(RedisModuleCtx *ctx, worker_process *worker, worker_pipe *p, RedisModuleFileProc read, int spair) {
-  if (spair) {
-    if (socketpair(AF_UNIX,SOCK_STREAM, 0, p->pipe) < 0) {
-      return REDISMODULE_ERR;
-    }
-  } else {
-    if (pipe(p->pipe) != 0) {
-      return REDISMODULE_ERR;
-    }
+static int32_t rpm_worker_pipe_init(RedisModuleCtx *ctx, worker_process *worker, worker_pipe *p,
+    RedisModuleFileProc read) {
+  if (pipe(p->pipe) != 0) {
+    return REDISMODULE_ERR;
   }
   RedisModule_EnableNonBlock(ctx, p->pipe[0]);
   rpm_worker_pipe_buffer_reset(p);
@@ -660,6 +722,35 @@ static int rpm_worker_pipe_init(RedisModuleCtx *ctx, worker_process *worker, wor
     return RedisModule_CreateFileEvent(ctx, p->pipe[0], REDISMODULE_READ, read, p);
   }
   return REDISMODULE_OK;
+}
+
+static int32_t rpm_worker_upstream_init(RedisModuleCtx *ctx, rpm_context *rpm, worker_process *worker, worker_upstream *upstream) {
+  REDISMODULE_NOT_USED(ctx);
+  if (socketpair(AF_UNIX,SOCK_STREAM, 0, upstream->pipe) < 0) {
+    return REDISMODULE_ERR;
+  }
+  upstream->worker = worker;
+  upstream->command_queue = queue_create(rpm->allocator, 1024);
+  return REDISMODULE_OK;
+}
+
+static int32_t rpm_worker_upstream_start(worker_process *worker, worker_upstream *upstream) {
+  int32_t st = REDISMODULE_OK;
+  pthread_mutex_lock(&worker->refcount_mutex);
+  worker->refcount++;
+  if (pthread_create(&upstream->writer, NULL, rpm_worker_upstream_writer_dispatch, upstream)) {
+    st = REDISMODULE_ERR;
+    worker->refcount--;
+    goto cleanup_exit;
+  }
+  worker->refcount++;
+  if (pthread_create(&upstream->reader, NULL, rpm_worker_upstream_reader_dispatch, upstream)) {
+    st = REDISMODULE_ERR;
+    worker->refcount--;
+  }
+cleanup_exit:
+  pthread_mutex_unlock(&worker->refcount_mutex);
+  return st;
 }
 
 static int rpm_worker_create_later(RedisModuleCtx *ctx, long long id, void *user_data) {
@@ -673,15 +764,56 @@ static int rpm_worker_create_later(RedisModuleCtx *ctx, long long id, void *user
   }
 }
 
+static void rpm_worker_free(worker_process *worker) {
+  queue_pop_result result;
+  chained_buffer *command;
+  int32_t idx;
+
+  if (worker->downstreams != NULL) {
+    RedisModule_Free(worker->downstreams);
+    worker->downstreams = NULL;
+  }
+
+  if (worker->upstreams != NULL) {
+    for (idx = 0; idx < worker->num_upstreams; ++idx) {
+      queue_peek(worker->upstreams[idx].command_queue, &result);
+      while ((command = queue_pop_result_next(&result)) != NULL) {
+        if (command != WORKER_PIPE_SHUTDOWN) {
+          chained_buffer_destroy(&command, 1);
+        }
+      }
+      queue_destroy(worker->upstreams[idx].command_queue);
+    }
+    RedisModule_Free(worker->upstreams);
+    worker->upstreams = NULL;
+  }
+
+  pthread_mutex_destroy(&worker->refcount_mutex);
+  pthread_mutex_destroy(&worker->client_id_to_request_id_mutex);
+  pthread_mutex_destroy(&worker->request_id_to_client_mutex);
+
+  RedisModule_Free(worker);
+}
+
+static void rpm_worker_release(worker_process *worker) {
+  int32_t free = 0;
+  pthread_mutex_lock(&worker->refcount_mutex);
+  free = --worker->refcount == 0;
+  pthread_mutex_unlock(&worker->refcount_mutex);
+  if (free) {
+    rpm_worker_free(worker);
+  }
+}
+
 static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_process *worker) {
   /* send worker dead error to pending requests of current worker */
   int64_t request_id;
   size_t ignored;
   int32_t idx;
-
   RedisModuleBlockedClient *bc = NULL;
-  redis_response_reader *reader;
 
+  rpm->worker = worker;
+  pthread_mutex_lock(&rpm->worker->request_id_to_client_mutex);
   hash_map_iterator *iterator = hash_map_iterator_create(worker->request_id_to_client);
   while (hash_map_iterator_next(iterator) != 0) {
     hash_map_iterator_get(iterator, (const void **) &request_id, &ignored, (const void **) &bc, &ignored);
@@ -689,7 +821,10 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_pro
   }
   hash_map_iterator_destroy(iterator);
   hash_map_destroy(worker->request_id_to_client);
+  pthread_mutex_unlock(&rpm->worker->request_id_to_client_mutex);
+  pthread_mutex_lock(&rpm->worker->client_id_to_request_id_mutex);
   hash_map_destroy(worker->client_id_to_request_id);
+  pthread_mutex_unlock(&rpm->worker->client_id_to_request_id_mutex);
   if (worker->downstreams != NULL) {
     for (idx = 0; idx < worker->num_downstreams; ++idx) {
       if (worker->downstreams[idx] != 0) {
@@ -697,34 +832,64 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_pro
         worker->downstreams[idx] = 0;
       }
     }
-    RedisModule_Free(worker->downstreams);
   }
   if (worker->upstreams != NULL) {
     for (idx = 0; idx < worker->num_upstreams; ++idx) {
-      rpm_worker_close_pipe(ctx, worker->upstreams + idx);
+      rpm_worker_upstream_submit(ctx, worker->upstreams + idx, WORKER_PIPE_SHUTDOWN);
+      pthread_join(worker->upstreams[idx].reader, NULL);
+      pthread_join(worker->upstreams[idx].writer, NULL);
+      rpm_worker_close_upstream(ctx, worker->upstreams + idx);
     }
-    RedisModule_Free(worker->upstreams);
-  }
-  if (worker->readers != NULL) {
-    for (idx = 0; idx < worker->num_upstreams; ++idx) {
-      if ((reader = worker->readers[idx]) != NULL) {
-        redis_response_reader_free(reader);
-      }
-    }
-    RedisModule_Free(worker->readers);
   }
   rpm_worker_close_pipe(ctx, &worker->out);
   rpm_worker_close_pipe(ctx, &worker->err);
   RedisModule_Log(ctx, "warning", "worker process is terminated prematurely, a new worker is being spawned");
   /* failed to create worker during initialization, setup a timer to try it again 10 ms later */
   RedisModule_CreateTimeEvent(ctx, 10, rpm_worker_create_later, rpm, NULL, &rpm->restart_timer);
+  RedisModule_DeleteFileEvent(ctx, worker->shutdown_pipe[0], REDISMODULE_READ);
   rpm->restart_count--;
-  RedisModule_Free(worker);
   if (++rpm->restart_count >= rpm->retry_attempts) {
     RedisModule_Log(ctx, "warning", "worker has been stopped %d times within last %d seconds, shutdown redis automatically", rpm->restart_count, rpm->retry_timeout);
     rpm_context_shutdown_redis(ctx, rpm);
   }
   rpm->worker = NULL;
+  rpm_worker_release(worker);
+}
+
+static void rpm_worker_suicide(RedisModuleCtx *ctx, worker_process *worker) {
+  int32_t idx;
+  for (idx = 0; idx < worker->num_upstreams; ++idx) {
+    rpm_worker_close_upstream(ctx, worker->upstreams + idx);
+  }
+  for (idx = 0; idx < worker->num_downstreams; ++idx) {
+    if (worker->downstreams[idx] != 0) {
+      close(worker->downstreams[idx]);
+      worker->downstreams[idx] = 0;
+    }
+  }
+}
+
+static void rpm_worker_shutdown_pipe_read(RedisModuleCtx *ctx, int fd, void *client_data, int mask) {
+  char buff;
+  int rd;
+  REDISMODULE_NOT_USED(mask);
+  while ((rd = read(fd, &buff, 1)) != 0) {
+    if (rd == 1) {
+      switch (buff) {
+        case WORKER_SHUTDOWN_EVENT_TYPE_SUICIDE:
+          RedisModule_Log(ctx, "warning", "worker process respond invalid response and will be restarted to fix the state.");
+          rpm_worker_suicide(ctx, client_data);
+          break;
+        case WORKER_SHUTDOWN_EVENT_TYPE_TERMINATE:
+          RedisModule_Log(ctx, "warning", "All upstream connections were closed, restart worker process now");
+          break;
+        default:
+          RedisModule_Log(ctx, "warning", "Received unknown upstream event %c", buff);
+          break;
+      }
+    }
+  }
+  rpm_worker_destroy(ctx, rpm_context_get(ctx), client_data);
 }
 
 static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) {
@@ -737,6 +902,16 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
   worker->client_id_to_request_id = hash_map_create(&int_key_map, 1024);
   worker->num_downstreams = rpm->num_downstreams;
   worker->num_upstreams = rpm->num_upstreams;
+  pthread_mutex_init(&worker->refcount_mutex, NULL);
+  pthread_mutex_init(&worker->request_id_to_client_mutex, NULL);
+  pthread_mutex_init(&worker->client_id_to_request_id_mutex, NULL);
+  worker->rpm = rpm;
+  worker->active_upstreams = worker->num_upstreams;
+  worker->refcount = 1;
+  if (pipe(worker->shutdown_pipe) != 0) {
+    RedisModule_Log(ctx, "warning", "Could not create worker shutdown pipe");
+    goto cleanup_exit;
+  }
   if ((worker->downstreams = RedisModule_Calloc(1, sizeof(worker->downstreams[0]) * worker->num_downstreams)) == NULL) {
     RedisModule_Log(ctx, "warning", "Could not allocate enough memory for downstreams, restart worker again");
     goto cleanup_exit;
@@ -747,8 +922,9 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
       goto cleanup_exit;
     }
   }
-  if ((worker->readers = RedisModule_Calloc(1, sizeof(worker->readers[0]) * worker->num_upstreams)) == NULL) {
-    RedisModule_Log(ctx, "warning", "Could not allocate enough memory for response reader, restart worker again");
+  if (rpm_worker_pipe_init(ctx, worker, &worker->out, rpm_worker_stdout_read) ||
+      rpm_worker_pipe_init(ctx, worker, &worker->err, rpm_worker_stderr_read)) {
+    RedisModule_Log(ctx, "warning", "Could not initiate stdout and stderr pipe, restart worker again");
     goto cleanup_exit;
   }
   if ((worker->upstreams = RedisModule_Calloc(1, sizeof(worker->upstreams[0]) * worker->num_upstreams)) == NULL) {
@@ -756,25 +932,17 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
     goto cleanup_exit;
   }
   for (idx = 0; idx < worker->num_upstreams; ++idx) {
-    worker->readers[idx] = redis_response_reader_create(rpm->allocator, 1024 * 1024);
-    if (rpm_worker_pipe_init(ctx, worker, worker->upstreams + idx, rpm_worker_upstream_read, 1)) {
+    if (rpm_worker_upstream_init(ctx, rpm, worker, worker->upstreams + idx)) {
       RedisModule_Log(ctx, "warning", "Could not initiate upstream pipe %d, restart worker again", idx);
       goto cleanup_exit;
     }
-    worker->upstreams[idx].user_data = worker->readers[idx];
   }
-  worker->active_upstreams = worker->num_upstreams;
-  if (rpm_worker_pipe_init(ctx, worker, &worker->out, rpm_worker_stdout_read, 0) ||
-      rpm_worker_pipe_init(ctx, worker, &worker->err, rpm_worker_stderr_read, 0)) {
-    RedisModule_Log(ctx, "warning", "Could not initiate stdout and stderr pipe, restart worker again");
-    goto cleanup_exit;
-  }
-
   time(&now);
   if (now >= rpm->restart_count_reset_time && (now - rpm->restart_count_reset_time) > rpm->retry_timeout) {
     rpm->restart_count_reset_time = now;
     rpm->restart_count = 0;
   }
+  RedisModule_CreateFileEvent(ctx, worker->shutdown_pipe[0], REDISMODULE_READ, rpm_worker_shutdown_pipe_read, worker);
 
   if ((pid = fork()) == 0) {
     rpm_worker_process_start(worker, rpm->argv);
@@ -789,6 +957,7 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
       goto cleanup_exit;
     }
     for (idx = 0; idx < worker->num_upstreams; ++idx) {
+      rpm_worker_upstream_start(worker, worker->upstreams + idx);
       if (worker->upstreams[idx].pipe[1] != 0) {
         close(worker->upstreams[idx].pipe[1]);
         worker->upstreams[idx].pipe[1] = 0;
@@ -814,7 +983,6 @@ cleanup_exit:
 static void rpm_context_destroy(RedisModuleCtx *ctx, rpm_context *rpm) {
   char **argv;
   if (rpm->worker != NULL) {
-    rpm_worker_suicide(ctx, rpm->worker);
     rpm_worker_destroy(ctx, rpm, rpm->worker);
   }
   if (rpm->command_timeout != NULL) {

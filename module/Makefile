@@ -17,7 +17,7 @@ all: rpm.so
 .c.xo:
 	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
 
-RPM_OBJECTS = rpm.xo rpm_allocator.xo rpm_chained_buffer.xo rpm_hashmap.xo rpm_redis.xo
+RPM_OBJECTS = rpm.xo rpm_allocator.xo rpm_chained_buffer.xo rpm_hashmap.xo rpm_redis.xo rpm_queue.xo
 
 rpm.xo: redismodule.h
 
