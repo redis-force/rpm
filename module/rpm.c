@@ -849,6 +849,7 @@ static void rpm_worker_destroy(RedisModuleCtx *ctx, rpm_context *rpm, worker_pro
     RedisModule_CreateTimeEvent(ctx, 10, rpm_worker_create_later, rpm, NULL, &rpm->restart_timer);
   }
   RedisModule_DeleteFileEvent(ctx, worker->shutdown_pipe[0], REDISMODULE_READ);
+  close(worker->shutdown_pipe[0]);
   rpm->restart_count--;
   if (++rpm->restart_count >= rpm->retry_attempts) {
     RedisModule_Log(ctx, "warning", "worker has been stopped %d times within last %d seconds, shutdown redis automatically", rpm->restart_count, rpm->retry_timeout);
