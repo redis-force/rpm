@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type dispatcher interface {
@@ -148,7 +147,7 @@ func newDownstreamDispatcher(conn net.Conn) dispatcher {
 	return &downstreamDispatcher{
 		requests: make(chan *redisRequest),
 		pending:  make(chan *redisRequest),
-		conn:     redis.NewConn(conn, time.Hour*0xFFFF, time.Hour*0xFFFF),
+		conn:     redis.NewConn(conn, 0, 0),
 	}
 }
 
