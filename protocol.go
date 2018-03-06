@@ -182,6 +182,7 @@ func consumeAllQuota(stack []int) []int {
 }
 
 type moduleResponse struct {
+	command                 []byte
 	response                *bytes.Buffer
 	lenBuffer               [32]byte
 	numBuffer               [40]byte
@@ -208,7 +209,7 @@ func writeInt64ToBuffer(prefix byte, n int64, buffer []byte) int {
 	return len(buffer) - idx
 }
 
-func newResponse(clientId, requestId, commandTimestamp, workerStartTimestamp int64) *moduleResponse {
+func newResponse(clientId, requestId int64, command []byte, commandTimestamp, workerStartTimestamp int64) *moduleResponse {
 	var header [130]byte
 	idx := len(header)
 	header[idx-1] = '\n'
@@ -227,6 +228,7 @@ func newResponse(clientId, requestId, commandTimestamp, workerStartTimestamp int
 	header[idx-4] = '*'
 	slice := header[idx-4:]
 	return &moduleResponse{
+		command:                 command,
 		response:                bytes.NewBuffer(slice),
 		quotaStack:              newQuotaStack(),
 		profileTimestamps:       [5]int64{commandTimestamp, workerStartTimestamp, 0, 0, 0},

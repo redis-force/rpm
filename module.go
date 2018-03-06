@@ -39,21 +39,21 @@ func (module *redisModule) downstream() dispatcher {
 
 func (module *redisModule) commandCleanup(clientId, requestId int64, cmd []byte, commandTimestamp int64, startTime time.Time) {
 	if r := recover(); r != nil {
-		msg := fmt.Sprintf("Failed to dispatch request %v(%v) from client %v:%v\n%s", cmd, requestId, clientId, r, string(debug.Stack()))
+		msg := fmt.Sprintf("Failed to dispatch request %s(%v) from client %v:%v\n%s", string(cmd), requestId, clientId, r, string(debug.Stack()))
 		module.logger.Print(msg)
-		response := newResponse(clientId, requestId, commandTimestamp, startTime.UnixNano()/1000)
+		response := newResponse(clientId, requestId, cmd, commandTimestamp, startTime.UnixNano()/1000)
 		response.WriteError("ERR Internal")
 		module.responses[clientId%int64(len(module.responses))].dispatch(response.serialize())
 	}
 	elapsed := time.Now().Sub(startTime)
 	if elapsed > slowCommandThreshold {
-		module.logger.Printf("Slow command: %v(%v) from client %v took %v\n", cmd, requestId, clientId, elapsed)
+		module.logger.Printf("Slow command: %s(%v) from client %v took %v\n", string(cmd), requestId, clientId, elapsed)
 	}
 }
 
 func (module *redisModule) onRequest(clientId, requestId, timestamp int64, request [][]byte) {
 	startTime := time.Now()
-	response := newResponse(clientId, requestId, timestamp, startTime.UnixNano()/1000)
+	response := newResponse(clientId, requestId, request[0], timestamp, startTime.UnixNano()/1000)
 	go func() {
 		response.updateProcessTime()
 		defer module.commandCleanup(clientId, requestId, request[0], timestamp, startTime)
@@ -164,7 +164,7 @@ func newModule(worker RedisModuleWorker, logger *log.Logger) (RedisModule, error
 		worker:         worker,
 		logger:         logger,
 		downstreams:    newDownstreamDispatchers(downstreams),
-		responses:      newResponseDispatchers(upstreams),
+		responses:      newResponseDispatchers(worker, upstreams),
 		requests:       newRequestDispatchers(upstreams),
 		numDownstreams: uint32(len(downstreams)),
 	}, nil

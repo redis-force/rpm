@@ -53,11 +53,21 @@ func SessionIdFromContext(ctx context.Context) int64 {
 	return ctx.Value(sessionIdKey).(int64)
 }
 
+type RedisModuleCommandProfile struct {
+	Command             []byte
+	RedisReceiveTime    int64
+	WorkerReceiveTime   int64
+	WorkerProcessTime   int64
+	WorkerSerializeTime int64
+	WorkerSendTime      int64
+}
+
 type RedisModuleWorker interface {
 	OnStart(ctx context.Context, redis RedisClient)
 	OnCommand(ctx context.Context, redis RedisClient, args [][]byte, response RedisModuleResponse)
 	OnError(ctx context.Context, err error)
 	OnStop(ctx context.Context, redis RedisClient)
+	OnCommandProfile(ctx context.Context, profile *RedisModuleCommandProfile)
 }
 
 func NewModuleWithLogger(worker RedisModuleWorker, logger *log.Logger) (module RedisModule, err error) {

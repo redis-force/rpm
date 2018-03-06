@@ -2,12 +2,14 @@ package rpm
 
 import (
 	"bufio"
+	"context"
 	"fmt"
-	"github.com/garyburd/redigo/redis"
 	"net"
 	"strconv"
 	"sync"
 	"sync/atomic"
+
+	"github.com/garyburd/redigo/redis"
 )
 
 type dispatcher interface {
@@ -163,13 +165,39 @@ type responseDispatcher struct {
 	dispatcherLifecycle
 	responses chan *moduleResponse
 	upstream  net.Conn
+	worker    RedisModuleWorker
 }
 
 func (dispatcher *responseDispatcher) run() {
 	upstream := dispatcher.upstream
+	profile := make(chan *moduleResponse, 1024)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		worker := dispatcher.worker
+		ctx := context.Background()
+		commandProfile := RedisModuleCommandProfile{}
+		for response := range profile {
+			commandProfile.Command = response.command
+			commandProfile.RedisReceiveTime = response.profileTimestamps[0]
+			commandProfile.WorkerReceiveTime = response.profileTimestamps[1]
+			commandProfile.WorkerProcessTime = response.profileTimestamps[2]
+			commandProfile.WorkerSerializeTime = response.profileTimestamps[3]
+			commandProfile.WorkerSendTime = response.profileTimestamps[4]
+			worker.OnCommandProfile(ctx, &commandProfile)
+		}
+	}()
 	for response := range dispatcher.responses {
 		response.write(upstream)
+		select {
+		case profile <- response:
+		default:
+			break
+		}
 	}
+	close(profile)
+	wg.Wait()
 }
 
 func (dispatcher *responseDispatcher) start(module *redisModule) {
@@ -191,17 +219,18 @@ func (dispatcher *responseDispatcher) dispatch(item interface{}) {
 	dispatcher.responses <- item.(*moduleResponse)
 }
 
-func newResponseDispatcher(upstream net.Conn) dispatcher {
+func newResponseDispatcher(worker RedisModuleWorker, upstream net.Conn) dispatcher {
 	return &responseDispatcher{
 		responses: make(chan *moduleResponse),
 		upstream:  upstream,
+		worker:    worker,
 	}
 }
 
-func newResponseDispatchers(upstreams []net.Conn) []dispatcher {
+func newResponseDispatchers(worker RedisModuleWorker, upstreams []net.Conn) []dispatcher {
 	dispatchers := make([]dispatcher, len(upstreams), len(upstreams))
 	for idx := range dispatchers {
-		dispatchers[idx] = newResponseDispatcher(upstreams[idx])
+		dispatchers[idx] = newResponseDispatcher(worker, upstreams[idx])
 	}
 	return dispatchers
 }

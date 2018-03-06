@@ -99,6 +99,10 @@ func generate(index int, response rpm.RedisModuleResponse) {
 	nest--
 }
 
+func (w *worker) OnCommandProfile(ctx context.Context, profile *rpm.RedisModuleCommandProfile) {
+	w.logger.Printf("Profile data for command %s: %v", string(profile.Command), *profile)
+}
+
 func (w *worker) OnCommand(ctx context.Context, redis rpm.RedisClient, args [][]byte, response rpm.RedisModuleResponse) {
 	w.logger.Printf("received request and generate response with type of %v", w.index)
 	generate(w.index, response)
