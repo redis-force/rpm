@@ -12,6 +12,7 @@ type RedisModule interface {
 	Join()
 	Shutdown()
 	NewRedisClient() RedisClient
+	ListenAndServe(address string) error
 }
 
 type RedisClient interface {

@@ -1,6 +1,7 @@
 package rpm
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -39,21 +40,21 @@ func (module *redisModule) downstream() dispatcher {
 
 func (module *redisModule) commandCleanup(clientId, requestId int64, cmd []byte, commandTimestamp int64, startTime time.Time) {
 	if r := recover(); r != nil {
-		msg := fmt.Sprintf("Failed to dispatch request %s(%v) from client %v:%v\n%s", string(cmd), requestId, clientId, r, string(debug.Stack()))
+		msg := fmt.Sprintf("Failed to dispatch request '%s'@%d from redis client %d:%v\n%s", string(cmd), requestId, clientId, r, string(debug.Stack()))
 		module.logger.Print(msg)
-		response := newResponse(clientId, requestId, cmd, commandTimestamp, startTime.UnixNano()/1000)
+		response := newRPMResponse(clientId, requestId, cmd, commandTimestamp, startTime.UnixNano()/1000)
 		response.WriteError("ERR Internal")
 		module.responses[clientId%int64(len(module.responses))].dispatch(response.serialize())
 	}
 	elapsed := time.Now().Sub(startTime)
 	if elapsed > slowCommandThreshold {
-		module.logger.Printf("Slow command: %s(%v) from client %v took %v\n", string(cmd), requestId, clientId, elapsed)
+		module.logger.Printf("Slow command: '%s'@%d from redis client %d took %v\n", string(cmd), requestId, clientId, elapsed)
 	}
 }
 
 func (module *redisModule) onRequest(clientId, requestId, timestamp int64, request [][]byte) {
 	startTime := time.Now()
-	response := newResponse(clientId, requestId, request[0], timestamp, startTime.UnixNano()/1000)
+	response := newRPMResponse(clientId, requestId, request[0], timestamp, startTime.UnixNano()/1000)
 	go func() {
 		response.updateProcessTime()
 		defer module.commandCleanup(clientId, requestId, request[0], timestamp, startTime)
@@ -113,6 +114,80 @@ func (module *redisModule) NewRedisClient() RedisClient {
 	return &redisClient{
 		module: module,
 		future: make(chan redisResponse),
+	}
+}
+
+func (module *redisModule) serve(socket net.Conn, clientId int64) {
+	reader := bufio.NewReader(socket)
+	writer := bufio.NewWriter(socket)
+	var lastCommand []byte
+	startTimeUs := new(int64)
+	ctx := context.WithValue(context.Background(), sessionIdKey, clientId)
+	redisClient := module.NewRedisClient()
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprintf("Failed to dispatch request '%s' from client %v:%v\n%s", string(lastCommand), socket.RemoteAddr(), r, string(debug.Stack()))
+			module.logger.Print(msg)
+			response := newDirectResponse(*startTimeUs, *startTimeUs)
+			response.WriteError("ERR Internal")
+			response.serialize()
+			writer.Write(response.serialized)
+			writer.Flush()
+			module.onError(errors.New(msg))
+		}
+		socket.Close()
+	}()
+	commandProfile := RedisModuleCommandProfile{}
+	for {
+		if request, err := newRequest(reader); err != nil {
+			module.onError(err)
+			return
+		} else {
+			startTime := time.Now()
+			*startTimeUs = startTime.UnixNano() / 1000
+			lastCommand = request[0]
+			response := newDirectResponse(*startTimeUs, *startTimeUs)
+			response.updateProcessTime()
+			module.worker.OnCommand(ctx, redisClient, request, response)
+			response.serialize()
+			if _, err = writer.Write(response.serialized); err != nil {
+				module.onError(err)
+				return
+			}
+			if err = writer.Flush(); err != nil {
+				module.onError(err)
+				return
+			}
+			commandProfile.Command = request[0]
+			commandProfile.RedisReceiveTime = *startTimeUs
+			commandProfile.WorkerReceiveTime = *startTimeUs
+			commandProfile.WorkerProcessTime = *startTimeUs
+			commandProfile.WorkerSerializeTime = response.profileTimestamps[3]
+			commandProfile.WorkerSendTime = time.Now().UnixNano() / 1000
+			module.worker.OnCommandProfile(ctx, &commandProfile)
+		}
+	}
+}
+
+func (module *redisModule) ListenAndServe(addr string) error {
+	if l, err := net.Listen("tcp", addr); err != nil {
+		return err
+	} else {
+		defer l.Close()
+		var clientId int64
+		for {
+			if c, err := l.Accept(); err != nil {
+				if e, ok := err.(net.Error); ok && e.Temporary() {
+					module.logger.Printf("Failed to accept a new connection: %v\n", e)
+					continue
+				} else {
+					return err
+				}
+			} else {
+				go module.serve(c, clientId)
+				clientId++
+			}
+		}
 	}
 }
 

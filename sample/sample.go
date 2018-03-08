@@ -139,6 +139,9 @@ func main() {
 		return
 	} else {
 		module.Start()
+		go func() {
+			panic(module.ListenAndServe(":6380"))
+		}()
 		module.Join()
 	}
 }
