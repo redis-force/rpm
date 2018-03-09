@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -65,7 +66,9 @@ func (module *redisModule) onRequest(clientId, requestId, timestamp int64, reque
 }
 
 func (module *redisModule) onError(err error) {
-	module.worker.OnError(context.Background(), err)
+	if err != io.EOF {
+		module.worker.OnError(context.Background(), err)
+	}
 }
 
 func (module *redisModule) start(d dispatcher) {
@@ -118,6 +121,8 @@ func (module *redisModule) NewRedisClient() RedisClient {
 }
 
 func (module *redisModule) serve(socket net.Conn, clientId int64) {
+	socket.(*net.TCPConn).SetKeepAlive(true)
+	socket.(*net.TCPConn).SetKeepAlivePeriod(time.Minute)
 	reader := bufio.NewReader(socket)
 	writer := bufio.NewWriter(socket)
 	var lastCommand []byte
