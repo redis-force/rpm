@@ -124,7 +124,6 @@ func (module *redisModule) serve(socket net.Conn, clientId int64) {
 	socket.(*net.TCPConn).SetKeepAlive(true)
 	socket.(*net.TCPConn).SetKeepAlivePeriod(time.Minute)
 	reader := bufio.NewReader(socket)
-	writer := bufio.NewWriter(socket)
 	var lastCommand []byte
 	startTimeUs := new(int64)
 	ctx := context.WithValue(context.Background(), sessionIdKey, clientId)
@@ -136,8 +135,7 @@ func (module *redisModule) serve(socket net.Conn, clientId int64) {
 			response := newDirectResponse(*startTimeUs, *startTimeUs)
 			response.WriteError("ERR Internal")
 			response.serialize()
-			writer.Write(response.serialized)
-			writer.Flush()
+			socket.Write(response.serialized)
 			module.onError(errors.New(msg))
 		}
 		socket.Close()
@@ -155,11 +153,7 @@ func (module *redisModule) serve(socket net.Conn, clientId int64) {
 			response.updateProcessTime()
 			module.worker.OnCommand(ctx, redisClient, request, response)
 			response.serialize()
-			if _, err = writer.Write(response.serialized); err != nil {
-				module.onError(err)
-				return
-			}
-			if err = writer.Flush(); err != nil {
+			if _, err = socket.Write(response.serialized); err != nil {
 				module.onError(err)
 				return
 			}
