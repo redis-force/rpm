@@ -424,7 +424,7 @@ static int rpm_worker_command_on_reply(RedisModuleCtx *ctx, RedisModuleString **
   } else {
     rpm_worker_command_on_reply_item(ctx, reply->payload.array.array[3]);
     if (rpm->debug_mode) {
-      rpm_log_profile_data(ctx, reply->receive_time, reply->upstream, reply->payload.array.array[0], 
+      rpm_log_profile_data(ctx, reply->receive_time, reply->upstream, reply->payload.array.array[0],
           reply->payload.array.array[1], reply->payload.array.array[2], "succeeded");
     }
   }
@@ -523,7 +523,7 @@ static int rpm_worker_upstream_write_command(RedisModuleCtx *ctx, RedisModuleStr
       third = "";
       omit = "";
     }
-    RedisModule_Log(ctx, "warning", "client %s execute command %s on stream %d@%p: %s %s %s %s", client_id_buffer, 
+    RedisModule_Log(ctx, "warning", "client %s execute command %s on stream %d@%p: %s %s %s %s", client_id_buffer,
         request_id_buffer, upstream->pipe[0], upstream, args[3], second, third, omit);
   }
   cmd = redis_format_command(rpm->allocator, argc + 3, args, args_len);
@@ -1027,6 +1027,67 @@ static void rpm_context_bool_config_parser(void *field, RedisModuleString **argv
   *((int32_t *) field) = 1;
 }
 
+typedef struct string_builder {
+  char *buffer;
+  size_t cap;
+  size_t size;
+} string_builder;
+
+static string_builder *rpm_string_builder_append(string_builder *builder, const char *needle, size_t len) {
+  if (len == 0) {
+    return builder;
+  }
+  if (builder == NULL) {
+    builder = RedisModule_Calloc(1, sizeof(string_builder));
+  }
+  if (builder->cap < builder->size + len + 1) {
+    builder->cap += len + 1;
+    builder->buffer = RedisModule_Realloc(builder->buffer, builder->cap);
+  }
+  memcpy(builder->buffer + builder->size, needle, len);
+  builder->size += len;
+  return builder;
+}
+
+static char *rpm_string_builder_build(string_builder *builder) {
+  char *str = builder->buffer;
+  builder->buffer[builder->size] = '\0';
+  RedisModule_Free(builder);
+  return str;
+}
+
+static char *rpm_evaluate_arg(const char *arg, size_t len) {
+  const char *env = NULL;
+  const char *value = NULL;
+  char *dup = RedisModule_Calloc(1, len + 1);
+  char *new_start = dup, *start = dup;
+  char *end = NULL;
+  const char *limit = start + len;
+  string_builder *builder = NULL;
+  memcpy(dup, arg, len + 1);
+  while (start < limit && (new_start = strstr(start, "${")) != NULL &&
+      (new_start + 3 < limit) && (end = strstr(new_start + 3, "}")) != NULL) {
+    env = new_start + 2;
+    *end = '\0';
+    builder = rpm_string_builder_append(builder, start, new_start - start);
+    if ((value = getenv(env)) != NULL) {
+      builder = rpm_string_builder_append(builder, value, strlen(value));
+    } else {
+      builder = rpm_string_builder_append(builder, "${", 2);
+      builder = rpm_string_builder_append(builder, env, strlen(env));
+      builder = rpm_string_builder_append(builder, "}", 1);
+    }
+    start = end + 1;
+  }
+  if (builder != NULL) {
+    builder = rpm_string_builder_append(builder, start, strlen(start));
+    RedisModule_Free(dup);
+    return rpm_string_builder_build(builder);
+  } else {
+    return dup;
+  }
+}
+
 static rpm_context *rpm_context_create(RedisModuleCtx *ctx, int argc, RedisModuleString **argv)
 {
   int idx, didx, is_config, last_is_command = 0;
@@ -1086,8 +1147,7 @@ static rpm_context *rpm_context_create(RedisModuleCtx *ctx, int argc, RedisModul
   rpm->argv = RedisModule_Alloc(sizeof(const char *) * (argc - idx + 1));
   for (didx = 0; idx < argc; ++didx, ++idx) {
     arg = RedisModule_StringPtrLen(argv[idx], &len);
-    rpm->argv[didx] = RedisModule_Calloc(1, len + 1);
-    memcpy(rpm->argv[didx], arg, len + 1);
+    rpm->argv[didx] = rpm_evaluate_arg(arg, len);
   }
   rpm->argv[didx] = NULL;
 
