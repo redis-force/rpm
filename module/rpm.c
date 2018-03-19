@@ -39,6 +39,7 @@ error "Only LP64 architectures are supported"
 #define ENV_RPM_DOWNSTREAM_FD_NUM "RPM_DOWNSTREAM_FD_NUM"
 #define ENV_RPM_UPSTREAM_FD_PREFIX "RPM_UPSTREAM_FD"
 #define ENV_RPM_UPSTREAM_FD_NUM "RPM_UPSTREAM_FD_NUM"
+#define ENV_RPM_WORKER_GENERATION "RPM_WORKER_GENERATION"
 
 #define WORKER_SHUTDOWN_EVENT_TYPE_SUICIDE 'S'
 #define WORKER_SHUTDOWN_EVENT_TYPE_TERMINATE 'T'
@@ -98,6 +99,7 @@ struct rpm_context {
   int32_t retry_timeout;
   int32_t retry_attempts;
   int32_t debug_mode;
+  int32_t generation;
   time_t restart_count_reset_time;
   char *shutdown_command;
   long long restart_timer;
@@ -658,7 +660,7 @@ static void rpm_worker_process_daemonize() {
   }
 }
 
-static void rpm_worker_process_start(worker_process *worker, char **argv) {
+static void rpm_worker_process_start(worker_process *worker, char **argv, int32_t generation) {
   long idx, cidx, closefd, max = sysconf(_SC_OPEN_MAX);
   char buff[32], envbuff[32 + sizeof(ENV_RPM_DOWNSTREAM_FD_PREFIX) + sizeof(ENV_RPM_UPSTREAM_FD_PREFIX)];
   rpm_worker_process_daemonize();
@@ -703,6 +705,8 @@ static void rpm_worker_process_start(worker_process *worker, char **argv) {
     snprintf(buff, sizeof(buff), "%d", worker->downstreams[cidx]);
     setenv(envbuff, buff, 1);
   }
+  snprintf(buff, sizeof(buff), "%d", generation);
+  setenv(ENV_RPM_WORKER_GENERATION, buff, 1);
   fprintf(stdout, "worker process %lld is spawned and prepare to serve requests\n", (long long) getpid());
   fflush(stdout);
   execvp(argv[0], argv);
@@ -896,7 +900,7 @@ static void rpm_worker_shutdown_pipe_read(RedisModuleCtx *ctx, int fd, void *cli
 }
 
 static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) {
-  int32_t idx;
+  int32_t idx, generation;
   int status;
   time_t now;
   pid_t pid;
@@ -947,8 +951,9 @@ static worker_process *rpm_worker_create(RedisModuleCtx *ctx, rpm_context *rpm) 
   }
   RedisModule_CreateFileEvent(ctx, worker->shutdown_pipe[0], REDISMODULE_READ, rpm_worker_shutdown_pipe_read, worker);
 
+  generation = rpm->generation++;
   if ((pid = fork()) == 0) {
-    rpm_worker_process_start(worker, rpm->argv);
+    rpm_worker_process_start(worker, rpm->argv, generation);
   } else if (pid == -1) {
     RedisModule_Log(ctx, "warning", "Could not create new worker process, restart worker again: %s", strerror(errno));
     goto cleanup_exit;
