@@ -40,6 +40,7 @@ error "Only LP64 architectures are supported"
 #define ENV_RPM_UPSTREAM_FD_PREFIX "RPM_UPSTREAM_FD"
 #define ENV_RPM_UPSTREAM_FD_NUM "RPM_UPSTREAM_FD_NUM"
 #define ENV_RPM_WORKER_GENERATION "RPM_WORKER_GENERATION"
+#define ENV_RPM_DOWNSTREAM_ADDRESS "RPM_DOWNSTREAM_ADDRESS"
 
 #define WORKER_SHUTDOWN_EVENT_TYPE_SUICIDE 'S'
 #define WORKER_SHUTDOWN_EVENT_TYPE_TERMINATE 'T'
@@ -102,6 +103,7 @@ struct rpm_context {
   int32_t generation;
   time_t restart_count_reset_time;
   char *shutdown_command;
+  char *downstream_address;
   long long restart_timer;
 };
 
@@ -125,6 +127,7 @@ static const rpm_context_config_descriptor rpm_config_descriptors[] = {
   {"--retry-attempts", 1, offsetof(rpm_context, retry_attempts), rpm_context_int32_config_parser},
   {"--shutdown-command", 1, offsetof(rpm_context, shutdown_command), rpm_context_string_config_parser},
   {"--debug", 0, offsetof(rpm_context, debug_mode), rpm_context_bool_config_parser},
+  {"--downstream-address", 1, offsetof(rpm_context, downstream_address), rpm_context_string_config_parser},
   {NULL, 0, 0, NULL},
 };
 
@@ -707,6 +710,9 @@ static void rpm_worker_process_start(worker_process *worker, char **argv, int32_
   }
   snprintf(buff, sizeof(buff), "%d", generation);
   setenv(ENV_RPM_WORKER_GENERATION, buff, 1);
+  if (worker->rpm->downstream_address && strlen(worker->rpm->downstream_address) > 0) {
+    setenv(ENV_RPM_DOWNSTREAM_ADDRESS, worker->rpm->downstream_address, 1);
+  }
   fprintf(stdout, "worker process %lld is spawned and prepare to serve requests\n", (long long) getpid());
   fflush(stdout);
   execvp(argv[0], argv);
@@ -1005,6 +1011,7 @@ static void rpm_context_destroy(RedisModuleCtx *ctx, rpm_context *rpm) {
   }
   RedisModule_Free(rpm->argv);
   RedisModule_Free(rpm->shutdown_command);
+  RedisModule_Free(rpm->downstream_address);
   RedisModule_Free(rpm);
 }
 
